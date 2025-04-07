@@ -40,6 +40,8 @@ def parse_args():
                         help='Fix A for multiplicative LoRA')
     parser.add_argument('--fix_b', action='store_true',
                         help='Fix B for multiplicative LoRA')
+    parser.add_argument('--lr_multiplier', type=float, default=10.0,
+                        help='Learning rate multiplier for multiplicative LoRA')
     
     args = parser.parse_args()
     return args
@@ -147,7 +149,7 @@ multiplicative_lora_config = LoraConfig(
         use_weight_norm=args.use_weight_norm,
         fix_a=args.fix_a,
         fix_b=args.fix_b,
-        lr_multiplier=10.,
+        lr_multiplier=args.lr_multiplier,
         normal_init=False,
     ),
 )
@@ -162,7 +164,8 @@ run_name = (f"{args.base_model}_r{args.r}"
             f"{'_exp' if args.use_exp else ''}"
             f"{'_wn' if args.use_weight_norm else ''}"
             f"{'_fixA' if args.fix_a else ''}"
-            f"{'_fixB' if args.fix_b else ''}")
+            f"{'_fixB' if args.fix_b else ''}"
+            f"{'_lrm' + str(args.lr_multiplier) if args.use_mlora else ''}")
 
 
 vit_training_args = TrainingArguments(
