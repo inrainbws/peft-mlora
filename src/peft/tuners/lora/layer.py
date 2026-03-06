@@ -80,6 +80,11 @@ class LoraLayer(BaseTunerLayer):
         self.base_layer = base_layer
         self.r = {}
         self.lora_alpha = {}
+        # Multiplicative LoRA (mLoRA) flag and config.
+        # When enabled, the adapter computes W' = W * BA (element-wise) instead of
+        # the standard additive LoRA formula W' = W + BA. This scales existing
+        # features rather than injecting new ones.
+        # Reference: https://arxiv.org/abs/2512.01759
         self.use_mlora = False
         self.mlora_config = None
         self.scaling = {}
@@ -179,7 +184,10 @@ class LoraLayer(BaseTunerLayer):
             lora_dropout_layer = nn.Identity()
 
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
-        # Actual trainable parameters
+        # Actual trainable parameters -- lora_A projects input down to rank r,
+        # lora_B projects back up. In mLoRA mode these same matrices are used
+        # to build the multiplicative scaling factor BA rather than an additive
+        # residual.
         self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
         self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=lora_bias)
         self.lora_bias[adapter_name] = lora_bias
@@ -215,6 +223,9 @@ class LoraLayer(BaseTunerLayer):
         else:
             self.use_dora[adapter_name] = False
 
+        # mLoRA requires its own initialization: weights are initialized so that
+        # the initial scaling factor BA ~= 1 (identity scaling), meaning the
+        # adapted model starts close to the pretrained model.
         if self.use_mlora:
             self.mlora_init(adapter_name)
 
@@ -248,7 +259,21 @@ class LoraLayer(BaseTunerLayer):
                 nn.init.zeros_(self.lora_embedding_B[adapter_name].bias)
 
     def mlora_init(self, adapter_name):
+        """Initialize weights for multiplicative LoRA.
+
+        The goal is to start near the identity transform (BA ~= 1) so the model
+        begins close to the pretrained weights. The lr_multiplier is divided out
+        here because it is multiplied back in during get_delta_weight(), giving
+        an effective initial value of ~1 for the product BA.
+
+        Three modes are supported:
+        - use_exp=True: weights initialized near 0 so exp(BA) ~= 1.
+        - init_mode="normal" / "uniform": direct multiplicative factors centered
+          around 1/lr_multiplier.
+        - default ("ones"): mean ~= 1/lr_multiplier with small std, so BA ~= 1.
+        """
         if self.mlora_config.use_exp:
+            # exp(~0) = 1, so small-std normal init yields near-identity scaling
             nn.init.normal_(self.lora_A[adapter_name].weight, std=0.01 / self.mlora_config.lr_multiplier)
             nn.init.normal_(self.lora_B[adapter_name].weight, std=0.01 / self.mlora_config.lr_multiplier)
         else:
@@ -260,6 +285,8 @@ class LoraLayer(BaseTunerLayer):
                 nn.init.uniform_(self.lora_A[adapter_name].weight, a=-magnitude, b=magnitude)
                 nn.init.uniform_(self.lora_B[adapter_name].weight, a=-magnitude, b=magnitude)
             else:
+                # Default "ones" mode: mean=1/lr_multiplier so that after
+                # multiplying by lr_multiplier, the effective scale ~= 1
                 nn.init.normal_(self.lora_A[adapter_name].weight, mean=1. / self.mlora_config.lr_multiplier, std=0.01 / self.mlora_config.lr_multiplier)
                 nn.init.normal_(self.lora_B[adapter_name].weight, mean=1. / self.mlora_config.lr_multiplier, std=0.01 / self.mlora_config.lr_multiplier)
 
@@ -750,15 +777,26 @@ class Linear(nn.Module, LoraLayer):
             weight_A = weight_A.float()
             weight_B = weight_B.float()
 
+        # --- Multiplicative LoRA modifications ---
+        # In mLoRA the low-rank product BA is used as an element-wise scaling
+        # factor for W (i.e. W' = W * BA) rather than an additive delta.
+        #
+        # lr_multiplier scales the raw weights so that a smaller effective
+        # learning rate can be used during training while keeping optimizer
+        # hyper-parameters unchanged.
         if self.use_mlora:
             weight_A = weight_A * self.mlora_config.lr_multiplier
             weight_B = weight_B * self.mlora_config.lr_multiplier
 
+        # fix_a / fix_b: ablation options that freeze one factor to the identity
+        # (ones in direct mode, zeros in exp mode so exp(0)=1).
         if self.use_mlora and self.mlora_config.fix_a:
             weight_A = torch.zeros_like(weight_A) if self.mlora_config.use_exp else torch.ones_like(weight_A)
         if self.use_mlora and self.mlora_config.fix_b:
             weight_B = torch.zeros_like(weight_B) if self.mlora_config.use_exp else torch.ones_like(weight_B)
 
+        # use_exp: parameterize the scaling factor in log-space, i.e.
+        # W' = W * exp(BA). This guarantees positive scaling factors.
         if self.use_mlora and self.mlora_config.use_exp:
             weight_A = torch.exp(weight_A)
             weight_B = torch.exp(weight_B)
@@ -785,22 +823,32 @@ class Linear(nn.Module, LoraLayer):
         elif adapter_names is not None:
             result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.use_mlora:
+            # Multiplicative LoRA forward pass for Linear layers.
+            # Standard LoRA:        output = Wx + BAx   (additive residual)
+            # Multiplicative LoRA:  output = (W * BA)x  (element-wise scaling)
+            #
+            # The delta_weight here is the low-rank product BA (possibly
+            # exponentiated), and we multiply it element-wise with the frozen
+            # base weight W to get the adapted weight W'.
             assert len(self.active_adapters) == 1
             active_adapter = self.active_adapters[0]
             delta_weight = self.get_delta_weight(active_adapter)
 
-            # Instead of modifying weights in-place, use a functional approach
             original_weight = self.base_layer.weight
-            
-            # Create adapted weights, maintaining computational graph
+
+            # W' = W * BA  (element-wise multiplication)
             adapted_weight = original_weight * delta_weight
-            
+
+            # Optional Frobenius-norm preservation: rescale W' so that
+            # ||W'||_F == ||W||_F, preventing the scaling from changing the
+            # overall magnitude of the weight matrix.
             if self.mlora_config.use_weight_norm:
                 fro_norm_adapted_weight = torch.norm(adapted_weight, p="fro")
                 fro_norm_base_weight = torch.norm(original_weight, p="fro")
                 adapted_weight = adapted_weight * fro_norm_base_weight / (fro_norm_adapted_weight + 1e-6)
-            
-            # Use F.linear directly with the adapted weights instead of modifying the layer's weights
+
+            # Use F.linear directly with the adapted weight to keep the
+            # computational graph intact for gradient flow through BA.
             if self.lora_bias[active_adapter]:
                 adapted_bias = self.base_layer.bias + self.lora_B[active_adapter].bias
                 result = F.linear(x, adapted_weight, adapted_bias)
@@ -1088,22 +1136,23 @@ class Embedding(nn.Module, LoraLayer):
         elif adapter_names is not None:
             result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.use_mlora:
+            # Multiplicative LoRA forward for Embedding layers.
+            # The embedding weight table is scaled element-wise: W' = W * BA
             assert len(self.active_adapters) == 1
             active_adapter = self.active_adapters[0]
             delta_weight = self.get_delta_weight(active_adapter)
 
-            # Instead of modifying weights in-place, use a functional approach
             original_weight = self.get_base_layer().weight
-            
-            # Create adapted weights, maintaining computational graph
+
+            # W' = W * BA  (element-wise multiplication of embedding table)
             adapted_weight = original_weight * delta_weight
-            
+
+            # Optional Frobenius-norm preservation (see Linear.forward)
             if self.mlora_config.use_weight_norm:
                 fro_norm_adapted_weight = torch.norm(adapted_weight, p="fro")
                 fro_norm_base_weight = torch.norm(original_weight, p="fro")
                 adapted_weight = adapted_weight * fro_norm_base_weight / (fro_norm_adapted_weight + 1e-6)
-            
-            # Use F.embedding directly with the adapted weights
+
             result = self._embed(x, adapted_weight)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
@@ -1385,6 +1434,7 @@ class _ConvNd(nn.Module, LoraLayer):
         weight_A = self.lora_A[adapter].weight
         weight_B = self.lora_B[adapter].weight
 
+        # --- Multiplicative LoRA modifications (see Linear.get_delta_weight) ---
         if self.use_mlora:
             weight_A = weight_A * self.mlora_config.lr_multiplier
             weight_B = weight_B * self.mlora_config.lr_multiplier
@@ -1435,22 +1485,25 @@ class _ConvNd(nn.Module, LoraLayer):
         elif adapter_names is not None:
             result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.use_mlora:
+            # Multiplicative LoRA forward for Conv layers.
+            # W' = W * BA  (element-wise), then run convolution with W'.
             assert len(self.active_adapters) == 1
             active_adapter = self.active_adapters[0]
             delta_weight = self.get_delta_weight(active_adapter)
 
-            # Instead of modifying weights in-place, use a functional approach
             original_weight = self.base_layer.weight
-            
-            # Create adapted weights, maintaining computational graph
+
+            # W' = W * BA  (element-wise multiplication of conv kernels)
             adapted_weight = original_weight * delta_weight
-            
+
+            # Optional Frobenius-norm preservation (see Linear.forward)
             if self.mlora_config.use_weight_norm:
                 fro_norm_adapted_weight = torch.norm(adapted_weight, p="fro")
                 fro_norm_base_weight = torch.norm(original_weight, p="fro")
                 adapted_weight = adapted_weight * fro_norm_base_weight / (fro_norm_adapted_weight + 1e-6)
-            
-            # Use F.conv directly with the adapted weights instead of modifying the layer's weights
+
+            # Use F.conv directly with the adapted weight to keep the
+            # computational graph intact for gradient flow through BA.
             base_layer = self.get_base_layer()
             if self.lora_bias[active_adapter]:
                 adapted_bias = base_layer.bias + self.lora_B[active_adapter].bias
