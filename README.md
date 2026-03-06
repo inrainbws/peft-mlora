@@ -31,8 +31,8 @@ This implementation supports several mLoRA variants via `MLoraConfig`:
 | Default | `W' = W ⊙ (BA · α/r)` | Direct multiplicative scaling |
 | `use_exp=True` | `W' = W ⊙ exp(BA)` | Log-space parameterization; guarantees positive scaling factors |
 | `use_weight_norm=True` | `W' = (W ⊙ BA) · ‖W‖_F / ‖W ⊙ BA‖_F` | Frobenius-norm preservation to prevent magnitude drift |
-| `fix_a=True` | `W' = W ⊙ (B · 1)` | Freeze A to identity (ablation) |
-| `fix_b=True` | `W' = W ⊙ (1 · A)` | Freeze B to identity (ablation) |
+| `fix_a=True` | `W' = W ⊙ (B · 1)` | Freeze A to identity |
+| `fix_b=True` | `W' = W ⊙ (1 · A)` | Freeze B to identity |
 
 The `lr_multiplier` parameter allows decoupling the effective learning rate for the adapter weights from the optimizer's global learning rate.
 
@@ -115,6 +115,31 @@ Multiplicative LoRA is implemented for:
 - `nn.Linear` (and HuggingFace `Conv1D`)
 - `nn.Embedding`
 - `nn.Conv2d` / `nn.Conv3d`
+
+## Code guide
+
+All mLoRA-specific changes live in two files under `src/peft/tuners/lora/`:
+
+### `config.py`
+
+- **`MLoraConfig`** (dataclass) — Holds all mLoRA-specific options (`use_exp`, `use_weight_norm`, `fix_a`, `fix_b`, `lr_multiplier`, `init_mode`).
+- **`LoraConfig`** — Extended with two new fields: `use_mlora: bool` and `mlora_config: Optional[MLoraConfig]`.
+
+### `layer.py`
+
+Changes span the three layer classes (`Linear`, `Embedding`, `_ConvNd`) and their shared base `LoraLayer`:
+
+| Location | What changed |
+|---|---|
+| `LoraLayer.__init__` | Added `use_mlora` / `mlora_config` instance attributes. |
+| `LoraLayer.update_layer` | Passes `use_mlora` / `mlora_config` through; calls `mlora_init()` after standard init when mLoRA is enabled. |
+| `LoraLayer.mlora_init` | **New method.** Initializes A and B so that the initial scaling factor BA ≈ 1 (identity), meaning the model starts close to the pretrained weights. Supports three modes: `use_exp` (small values so exp ≈ 1), `normal`/`uniform`, and the default `ones`. |
+| `Linear.get_delta_weight` | Applies `lr_multiplier`, `fix_a`/`fix_b`, and `use_exp` transforms to A and B before computing the low-rank product BA. In standard LoRA this product is an additive delta; in mLoRA it becomes the element-wise scaling factor. |
+| `Linear.forward` | **New branch** (`elif self.use_mlora`): computes `W' = W ⊙ BA` and calls `F.linear(x, W')` directly instead of adding a residual. Optionally preserves the Frobenius norm of W. |
+| `Embedding.update_layer` / `Embedding.forward` | Same pattern as Linear — mLoRA config propagation and `W' = W ⊙ BA` applied to the embedding weight table via `F.embedding`. |
+| `_ConvNd.update_layer` / `_ConvNd.get_delta_weight` / `_ConvNd.forward` | Same pattern as Linear — mLoRA config propagation, delta weight transforms, and `W' = W ⊙ BA` applied to conv kernels via `F.conv2d`/`F.conv3d`. |
+
+The helper function `dual_normal_init_` at the top of `layer.py` is a utility (not mLoRA-specific) for mixed-distribution weight initialization.
 
 ## Citation
 
