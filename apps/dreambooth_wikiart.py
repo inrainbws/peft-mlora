@@ -1,3 +1,6 @@
+import sys, os
+sys.path.insert(0, os.getcwd())
+
 import argparse
 import gc
 import hashlib
@@ -37,18 +40,20 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
+from sklearn.metrics.pairwise import polynomial_kernel
+import wandb
 
-from peft import LoraConfig, get_peft_model
-
+from peft import LoraConfig, MLoraConfig, get_peft_model
+from apps.util import CLIPEvaluator, CMMMDEvaluator
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.10.0.dev0")
 
 logger = get_logger(__name__)
 
-UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
+# UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
+UNET_TARGET_MODULES = ["conv", "conv1", "conv2", "to_q", "to_v", "query", "value"]
 TEXT_ENCODER_TARGET_MODULES = ["q_proj", "v_proj"]
-
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
@@ -71,12 +76,12 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
 
 
 def parse_args(input_args=None):
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(description="Dreambooth finetuning on WikiArt dataset.")
     parser.add_argument(
-        "--pretrained_model",
+        "--pretrained_model_name_or_path",
         type=str,
-        default="stabilityai/stable-diffusion-xl-base-1.0",
-        required=True,
+        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
+        required=False,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -92,12 +97,34 @@ def parse_args(input_args=None):
         default=None,
         help="Pretrained tokenizer name or path if not the same as model_name",
     )
+    
+    # WikiArt specific arguments
+    parser.add_argument(
+        "--art_style",
+        type=str,
+        required=True,
+        help="The specific art style from WikiArt dataset to finetune on (e.g., 'Impressionism', 'Cubism', etc.)",
+    )
+    parser.add_argument(
+        "--num_train_images",
+        type=int,
+        default=1000,
+        help="Number of training images to use from the WikiArt dataset for the selected style",
+    )
+    parser.add_argument(
+        "--evaluation_images",
+        type=int,
+        default=2048,
+        help="Number of images to use for CMMD evaluation",
+    )
+    
+    # Legacy arguments - keeping for compatibility but some won't be used
     parser.add_argument(
         "--instance_data_dir",
         type=str,
         default=None,
-        required=True,
-        help="A folder containing the training data of instance images.",
+        required=False,
+        help="Only used for legacy support, data will be loaded from WikiArt dataset",
     )
     parser.add_argument(
         "--class_data_dir",
@@ -110,8 +137,8 @@ def parse_args(input_args=None):
         "--instance_prompt",
         type=str,
         default=None,
-        required=True,
-        help="The prompt with identifier specifying the instance",
+        required=False,
+        help="The prompt will be generated based on the art style",
     )
     parser.add_argument(
         "--class_prompt",
@@ -157,6 +184,11 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--compute_clip_metrics",
+        action="store_true",
+        help="Whether to compute CLIP-I and CLIP-T metrics during validation.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="train_dreambooth_outputs",
@@ -185,7 +217,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--lora_bias",
         type=str,
-        default="none",
+        default="lora_only",
         help="Bias type for Lora. Can be 'none', 'all' or 'lora_only', only used if use_lora is True",
     )
     parser.add_argument(
@@ -212,6 +244,15 @@ def parse_args(input_args=None):
         default="none",
         help="Bias type for Lora. Can be 'none', 'all' or 'lora_only', only used if use_lora and `train_text_encoder` are True",
     )
+    
+    # mlora args
+    parser.add_argument("--use_mlora", action="store_true", help="Whether to use multiplicative LoRA instead of additive LoRA")
+    parser.add_argument("--use_exp", action="store_true", help="Use exponential in multiplicative LoRA")
+    parser.add_argument("--use_weight_norm", action="store_true", help="Use weight normalization for multiplicative LoRA")
+    parser.add_argument("--fix_a", action="store_true", help="Fix A for multiplicative LoRA")
+    parser.add_argument("--fix_b", action="store_true", help="Fix B for multiplicative LoRA")
+    parser.add_argument("--use_normal_init", action="store_true", help="Initialize with normal distribution for multiplicative LoRA")
+    parser.add_argument("--lr_multiplier", type=float, default=10.0, help="Learning rate multiplier for multiplicative LoRA")
 
     parser.add_argument(
         "--num_dataloader_workers", type=int, default=1, help="Num of workers for the training dataloader."
@@ -225,7 +266,7 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=5, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
         "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
@@ -270,7 +311,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-6,
+        default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -289,7 +330,7 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
         "--lr_num_cycles",
@@ -334,7 +375,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--report_to",
         type=str,
-        default="tensorboard",
+        default="wandb",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
@@ -343,13 +384,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--wandb_key",
         type=str,
-        default=None,
+        default="28899d4b108b71d6f70baa06baf5bfc684bcac97",
         help=("If report to option is set to wandb, api-key for wandb used for login to wandb "),
     )
     parser.add_argument(
         "--wandb_project_name",
         type=str,
-        default=None,
+        default="mlora_dreambooth",
         help=("If report to option is set to wandb, project name in wandb for log tracking  "),
     )
     parser.add_argument(
@@ -376,6 +417,12 @@ def parse_args(input_args=None):
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+    )
+    parser.add_argument(
+        "--cmmd_evaluation_steps",
+        type=int,
+        default=1000,
+        help="Run CMMD evaluation every X steps to track generation quality.",
     )
 
     if input_args is not None:
@@ -455,45 +502,42 @@ class TorchTracemalloc:
         # print(f"delta used/peak {self.used:4d}/{self.peaked:4d}")
 
 
-class DreamBoothDataset(Dataset):
+class WikiArtStyleDataset(Dataset):
     """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
+    A dataset to prepare WikiArt images of a specific style with prompts for dreambooth fine-tuning.
     """
-
     def __init__(
         self,
-        instance_data_root,
-        instance_prompt,
+        style_name,
         tokenizer,
-        class_data_root=None,
-        class_prompt=None,
         size=512,
         center_crop=False,
+        num_images=None
     ):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
-
-        self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError("Instance images root doesn't exists.")
-
-        self.instance_images_path = list(Path(instance_data_root).iterdir())
-        self.num_instance_images = len(self.instance_images_path)
-        self.instance_prompt = instance_prompt
-        self._length = self.num_instance_images
-
-        if class_data_root is not None:
-            self.class_data_root = Path(class_data_root)
-            self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-            self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
-            self.class_prompt = class_prompt
-        else:
-            self.class_data_root = None
-
+        self.style_name = style_name
+        
+        # Load WikiArt dataset from Hugging Face
+        self.dataset = datasets.load_dataset("Artificio/WikiArt", split="train")
+        
+        # Filter by style
+        self.style_images = self.dataset.filter(lambda x: x["style"] == style_name)
+        
+        if num_images is not None and len(self.style_images) > num_images:
+            # Take a random sample if we have more images than needed
+            self.style_images = self.style_images.shuffle(seed=42).select(range(num_images))
+        
+        self.num_images = len(self.style_images)
+        if self.num_images == 0:
+            raise ValueError(f"No images found for style: {style_name}")
+            
+        logger.info(f"Found {self.num_images} images for style: {style_name}")
+        
+        # Create a prompt that includes the style name
+        self.prompt = f"A {style_name} style painting"
+        
         self.image_transforms = transforms.Compose(
             [
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -504,47 +548,34 @@ class DreamBoothDataset(Dataset):
         )
 
     def __len__(self):
-        return self._length
+        return self.num_images
 
     def __getitem__(self, index):
         example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
-        example["instance_images"] = self.image_transforms(instance_image)
+        
+        # Get the image from the dataset
+        image_data = self.style_images[index]["image"]
+        if not isinstance(image_data, Image.Image):
+            image_data = Image.fromarray(image_data)
+            
+        if not image_data.mode == "RGB":
+            image_data = image_data.convert("RGB")
+            
+        example["instance_images"] = self.image_transforms(image_data)
         example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
+            self.prompt,
             truncation=True,
             padding="max_length",
             max_length=self.tokenizer.model_max_length,
             return_tensors="pt",
         ).input_ids
 
-        if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt_ids"] = self.tokenizer(
-                self.class_prompt,
-                truncation=True,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                return_tensors="pt",
-            ).input_ids
-
         return example
 
 
-def collate_fn(examples, with_prior_preservation=False):
+def collate_fn(examples):
     input_ids = [example["instance_prompt_ids"] for example in examples]
     pixel_values = [example["instance_images"] for example in examples]
-
-    # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
-    if with_prior_preservation:
-        input_ids += [example["class_prompt_ids"] for example in examples]
-        pixel_values += [example["class_images"] for example in examples]
 
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -552,14 +583,14 @@ def collate_fn(examples, with_prior_preservation=False):
     input_ids = torch.cat(input_ids, dim=0)
 
     batch = {
-        "input_ids": input_ids,
-        "pixel_values": pixel_values,
+        "instance_prompt_ids": input_ids,
+        "instance_images": pixel_values,
     }
     return batch
 
 
 class PromptDataset(Dataset):
-    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
+    """A simple dataset to prepare the prompts to generate class images on multiple GPUs."""
 
     def __init__(self, prompt, num_samples):
         self.prompt = prompt
@@ -573,6 +604,86 @@ class PromptDataset(Dataset):
         example["prompt"] = self.prompt
         example["index"] = index
         return example
+
+
+def evaluate_cmmd(args, accelerator, pipeline, style_name, device):
+    """
+    Evaluate CMMD between generated images and real images from WikiArt dataset
+    """
+    logger.info("Starting CMMD evaluation...")
+    
+    # Load evaluation images from WikiArt dataset
+    dataset = datasets.load_dataset("Artificio/WikiArt", split="train")
+    style_images = dataset.filter(lambda x: x["style"] == style_name)
+    
+    if len(style_images) < args.evaluation_images:
+        logger.info(f"Only {len(style_images)} images available for style {style_name}. Using all available images.")
+        num_eval_images = len(style_images)
+    else:
+        num_eval_images = args.evaluation_images
+        # Get a random subset for evaluation
+        style_images = style_images.shuffle(seed=42).select(range(num_eval_images))
+    
+    # Process real images
+    real_images = []
+    transform = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor(),
+    ])
+    
+    logger.info(f"Processing {num_eval_images} real images...")
+    for img_data in tqdm(style_images, desc="Processing real images"):
+        img = img_data["image"]
+        if not isinstance(img, Image.Image):
+            img = Image.fromarray(img)
+        if not img.mode == "RGB":
+            img = img.convert("RGB")
+        real_images.append(transform(img))
+    
+    # Generate images
+    logger.info(f"Generating {num_eval_images} images...")
+    prompt = f"A {style_name} style painting"
+    
+    generated_images = []
+    
+    # Generate in batches
+    batch_size = 8
+    num_batches = (num_eval_images + batch_size - 1) // batch_size
+    
+    with torch.no_grad():
+        for i in tqdm(range(num_batches), desc="Generating images"):
+            batch_prompts = [prompt] * min(batch_size, num_eval_images - i * batch_size)
+            batch_images = pipeline(batch_prompts, num_inference_steps=25).images
+            generated_images.extend(batch_images)
+    
+    # Compute CMMD
+    logger.info("Computing CMMD score...")
+    cmmd_evaluator = CMMMDEvaluator(device=device)
+    cmmd_score = cmmd_evaluator.compute_cmmd(real_images, generated_images)
+    
+    logger.info(f"CMMD score: {cmmd_score}")
+    
+    # Log to trackers
+    if accelerator.is_main_process:
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                tracker.writer.add_scalar("cmmd", cmmd_score, 0)
+            if tracker.name == "wandb":
+                tracker.log({"cmmd": cmmd_score})
+                
+                # Log sample images
+                tracker.log({
+                    "real_samples": [
+                        wandb.Image(real_images[i].permute(1, 2, 0).numpy())
+                        for i in range(min(8, len(real_images)))
+                    ],
+                    "generated_samples": [
+                        wandb.Image(generated_images[i])
+                        for i in range(min(8, len(generated_images)))
+                    ]
+                })
+    
+    return cmmd_score
 
 
 def main(args):
@@ -589,6 +700,11 @@ def main(args):
 
         wandb.login(key=args.wandb_key)
         wandb.init(project=args.wandb_project_name)
+    # Set the validation prompt if not provided
+    if args.validation_prompt is None:
+        args.validation_prompt = f"A {args.art_style} style painting"
+        logger.info(f"Validation prompt automatically set to: '{args.validation_prompt}'")
+
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
     # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
     # TODO (patil-suraj): Remove this check when gradient accumulation with two models is enabled in accelerate.
@@ -617,52 +733,6 @@ def main(args):
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
-
-    # Generate class images if prior preservation is enabled.
-    if args.with_prior_preservation:
-        class_images_dir = Path(args.class_data_dir)
-        if not class_images_dir.exists():
-            class_images_dir.mkdir(parents=True)
-        cur_class_images = len(list(class_images_dir.iterdir()))
-
-        if cur_class_images < args.num_class_images:
-            torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-            if args.prior_generation_precision == "fp32":
-                torch_dtype = torch.float32
-            elif args.prior_generation_precision == "fp16":
-                torch_dtype = torch.float16
-            elif args.prior_generation_precision == "bf16":
-                torch_dtype = torch.bfloat16
-            pipeline = DiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                torch_dtype=torch_dtype,
-                safety_checker=None,
-                revision=args.revision,
-            )
-            pipeline.set_progress_bar_config(disable=True)
-
-            num_new_images = args.num_class_images - cur_class_images
-            logger.info(f"Number of class images to sample: {num_new_images}.")
-
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
-
-            sample_dataloader = accelerator.prepare(sample_dataloader)
-            pipeline.to(accelerator.device)
-
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                images = pipeline(example["prompt"]).images
-
-                for i, image in enumerate(images):
-                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
-
-            del pipeline
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -713,31 +783,65 @@ def main(args):
     )
 
     if args.use_lora:
-        config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=UNET_TARGET_MODULES,
-            lora_dropout=args.lora_dropout,
-            bias=args.lora_bias,
-        )
+        if args.use_mlora:
+            config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=1,  # For MLora, alpha is typically set to 1
+                target_modules=UNET_TARGET_MODULES,
+                lora_dropout=args.lora_dropout,
+                bias=args.lora_bias,
+                use_mlora=True,
+                mlora_config=MLoraConfig(
+                    use_exp=args.use_exp,
+                    use_weight_norm=args.use_weight_norm,
+                    fix_a=args.fix_a,
+                    fix_b=args.fix_b,
+                    lr_multiplier=args.lr_multiplier,
+                    normal_init=args.use_normal_init,
+                ),
+            )
+        else:
+            config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=UNET_TARGET_MODULES,
+                lora_dropout=args.lora_dropout,
+                bias=args.lora_bias,
+            )
         unet = get_peft_model(unet, config)
         unet.print_trainable_parameters()
-        print(unet)
 
     vae.requires_grad_(False)
     if not args.train_text_encoder:
         text_encoder.requires_grad_(False)
     elif args.train_text_encoder and args.use_lora:
-        config = LoraConfig(
-            r=args.lora_text_encoder_r,
-            lora_alpha=args.lora_text_encoder_alpha,
-            target_modules=TEXT_ENCODER_TARGET_MODULES,
-            lora_dropout=args.lora_text_encoder_dropout,
-            bias=args.lora_text_encoder_bias,
-        )
+        if args.use_mlora:
+            config = LoraConfig(
+                r=args.lora_text_encoder_r,
+                lora_alpha=1,  # For MLora, alpha is typically set to 1
+                target_modules=TEXT_ENCODER_TARGET_MODULES,
+                lora_dropout=args.lora_text_encoder_dropout,
+                bias=args.lora_text_encoder_bias,
+                use_mlora=True,
+                mlora_config=MLoraConfig(
+                    use_exp=args.use_exp,
+                    use_weight_norm=args.use_weight_norm,
+                    fix_a=args.fix_a,
+                    fix_b=args.fix_b,
+                    lr_multiplier=args.lr_multiplier,
+                    normal_init=args.use_normal_init,
+                ),
+            )
+        else:
+            config = LoraConfig(
+                r=args.lora_text_encoder_r,
+                lora_alpha=args.lora_text_encoder_alpha,
+                target_modules=TEXT_ENCODER_TARGET_MODULES,
+                lora_dropout=args.lora_text_encoder_dropout,
+                bias=args.lora_text_encoder_bias,
+            )
         text_encoder = get_peft_model(text_encoder, config)
         text_encoder.print_trainable_parameters()
-        print(text_encoder)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -787,21 +891,19 @@ def main(args):
     )
 
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
+    train_dataset = WikiArtStyleDataset(
+        style_name=args.art_style,
         tokenizer=tokenizer,
         size=args.resolution,
         center_crop=args.center_crop,
+        num_images=args.num_train_images
     )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        collate_fn=collate_fn,
         num_workers=args.num_dataloader_workers,
     )
 
@@ -854,7 +956,101 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("dreambooth", config=vars(args))
+        # Extract a run name from the output directory
+        run_name = os.path.basename(os.path.normpath(args.output_dir))
+        experiment_config = vars(args)
+        # Add run_name to the tracking configuration
+        accelerator.init_trackers(
+            "dreambooth", 
+            config=experiment_config,
+            init_kwargs={"wandb": {"name": run_name}}
+        )
+        logger.info(f"Wandb run initialized with name: {run_name}")
+        
+    # Evaluate CMMD at step 0 to establish a baseline
+    if accelerator.is_main_process:
+        logger.info("Evaluating CMMD at step 0 (before training)...")
+        # Create evaluation pipeline with the pre-trained model
+        eval_pipeline = DiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            safety_checker=None,
+            revision=args.revision,
+        )
+        eval_pipeline = eval_pipeline.to(accelerator.device)
+        eval_pipeline.set_progress_bar_config(disable=True)
+        
+        # Run smaller CMMD evaluation to save time
+        num_eval_images = min(1000, args.evaluation_images)
+        
+        # Load evaluation images from WikiArt dataset
+        dataset = datasets.load_dataset("Artificio/WikiArt", split="train")
+        style_images = dataset.filter(lambda x: x["style"] == args.art_style)
+        
+        if len(style_images) < num_eval_images:
+            num_eval_images = len(style_images)
+            
+        # Get a random subset for evaluation
+        style_images = style_images.shuffle(seed=42).select(range(num_eval_images))
+        
+        # Process real images
+        real_images = []
+        transform = transforms.Compose([
+            transforms.Resize((512, 512)),
+            transforms.ToTensor(),
+        ])
+        
+        logger.info(f"Processing {num_eval_images} real images...")
+        for img_data in tqdm(style_images, desc="Processing real images"):
+            img = img_data["image"]
+            if not isinstance(img, Image.Image):
+                img = Image.fromarray(img)
+            if not img.mode == "RGB":
+                img = img.convert("RGB")
+            real_images.append(transform(img))
+        
+        # Generate images
+        logger.info(f"Generating {num_eval_images} images...")
+        prompt = f"A {args.art_style} style painting"
+        generated_images = []
+        
+        # Generate in batches
+        batch_size = 8
+        num_batches = (num_eval_images + batch_size - 1) // batch_size
+        
+        with torch.no_grad():
+            for i in tqdm(range(num_batches), desc="Generating images"):
+                batch_prompts = [prompt] * min(batch_size, num_eval_images - i * batch_size)
+                batch_images = eval_pipeline(batch_prompts, num_inference_steps=25).images
+                generated_images.extend(batch_images)
+        
+        # Compute CMMD
+        cmmd_evaluator = CMMMDEvaluator(device=accelerator.device)
+        cmmd_score = cmmd_evaluator.compute_cmmd(real_images, generated_images)
+        
+        logger.info(f"Step 0 CMMD score (baseline): {cmmd_score}")
+        
+        # Log to trackers
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                tracker.writer.add_scalar("cmmd", cmmd_score, 0)
+            if tracker.name == "wandb":
+                tracker.log({"cmmd": cmmd_score})
+                
+                # Log sample images
+                tracker.log({
+                    "cmmd_eval/step0_real_samples": [
+                        wandb.Image(real_images[i].permute(1, 2, 0).numpy())
+                        for i in range(min(4, len(real_images)))
+                    ],
+                    "cmmd_eval/step0_generated_samples": [
+                        wandb.Image(generated_images[i])
+                        for i in range(min(4, len(generated_images)))
+                    ]
+                })
+        
+        # Clean up
+        del eval_pipeline
+        torch.cuda.empty_cache()
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -908,7 +1104,7 @@ def main(args):
 
                 with accelerator.accumulate(unet):
                     # Convert images to latent space
-                    latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                    latents = vae.encode(batch["instance_images"].to(dtype=weight_dtype)).latent_dist.sample()
                     latents = latents * 0.18215
 
                     # Sample noise that we'll add to the latents
@@ -925,7 +1121,7 @@ def main(args):
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                     # Get the text embedding for conditioning
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    encoder_hidden_states = text_encoder(batch["instance_prompt_ids"])[0]
 
                     # Predict the noise residual
                     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -938,21 +1134,8 @@ def main(args):
                     else:
                         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                    if args.with_prior_preservation:
-                        # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                        model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                        target, target_prior = torch.chunk(target, 2, dim=0)
-
-                        # Compute instance loss
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-                        # Compute prior loss
-                        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
-
-                        # Add the prior loss to the instance loss.
-                        loss = loss + args.prior_loss_weight * prior_loss
-                    else:
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    # Compute loss
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
@@ -973,11 +1156,107 @@ def main(args):
                         accelerator.print(progress_bar)
                     global_step += 1
 
-                    # if global_step % args.checkpointing_steps == 0:
-                    #     if accelerator.is_main_process:
-                    #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    #         accelerator.save_state(save_path)
-                    #         logger.info(f"Saved state to {save_path}")
+                    if global_step % args.checkpointing_steps == 0:
+                        if accelerator.is_main_process:
+                            save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                            accelerator.save_state(save_path)
+                            logger.info(f"Saved state to {save_path}")
+                            
+                    # Run CMMD evaluation at specified intervals
+                    if global_step % args.cmmd_evaluation_steps == 0 and accelerator.is_main_process:
+                        logger.info(f"Running CMMD evaluation at step {global_step}...")
+                        
+                        # Create pipeline for evaluation
+                        eval_pipeline = DiffusionPipeline.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            safety_checker=None,
+                            revision=args.revision,
+                        )
+                        # Unwrap models
+                        eval_pipeline.unet = accelerator.unwrap_model(unet, keep_fp32_wrapper=True)
+                        
+                        # Always ensure we have a text encoder
+                        if args.train_text_encoder:
+                            eval_pipeline.text_encoder = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
+                        # If we didn't train the text encoder, the pipeline's default text_encoder is used
+                        
+                        eval_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(eval_pipeline.scheduler.config)
+                        eval_pipeline = eval_pipeline.to(accelerator.device)
+                        eval_pipeline.set_progress_bar_config(disable=True)
+                        
+                        # Run smaller CMMD evaluation during training to save time
+                        num_eval_images = min(1000, args.evaluation_images)  # Use fewer images during training
+                        
+                        # Load evaluation images from WikiArt dataset
+                        dataset = datasets.load_dataset("Artificio/WikiArt", split="train")
+                        style_images = dataset.filter(lambda x: x["style"] == args.art_style)
+                        
+                        if len(style_images) < num_eval_images:
+                            num_eval_images = len(style_images)
+                            
+                        # Get a random subset for evaluation
+                        style_images = style_images.shuffle(seed=42+global_step).select(range(num_eval_images))
+                        
+                        # Process real images
+                        real_images = []
+                        transform = transforms.Compose([
+                            transforms.Resize((512, 512)),
+                            transforms.ToTensor(),
+                        ])
+                        
+                        logger.info(f"Processing {num_eval_images} real images...")
+                        for img_data in tqdm(style_images, desc="Processing real images"):
+                            img = img_data["image"]
+                            if not isinstance(img, Image.Image):
+                                img = Image.fromarray(img)
+                            if not img.mode == "RGB":
+                                img = img.convert("RGB")
+                            real_images.append(transform(img))
+                        
+                        # Generate images
+                        logger.info(f"Generating {num_eval_images} images...")
+                        prompt = f"A {args.art_style} style painting"
+                        generated_images = []
+                        
+                        # Generate in batches
+                        batch_size = 8
+                        num_batches = (num_eval_images + batch_size - 1) // batch_size
+                        
+                        with torch.no_grad():
+                            for i in tqdm(range(num_batches), desc="Generating images"):
+                                batch_prompts = [prompt] * min(batch_size, num_eval_images - i * batch_size)
+                                batch_images = eval_pipeline(batch_prompts, num_inference_steps=25).images
+                                generated_images.extend(batch_images)
+                        
+                        # Compute CMMD
+                        logger.info("Computing CMMD score...")
+                        cmmd_evaluator = CMMMDEvaluator(device=accelerator.device)
+                        cmmd_score = cmmd_evaluator.compute_cmmd(real_images, generated_images)
+                        
+                        logger.info(f"Step {global_step} CMMD score: {cmmd_score}")
+                        
+                        # Log to trackers
+                        for tracker in accelerator.trackers:
+                            if tracker.name == "tensorboard":
+                                tracker.writer.add_scalar("cmmd", cmmd_score, global_step)
+                            if tracker.name == "wandb":
+                                tracker.log({"cmmd": cmmd_score})
+                                
+                                # Log sample images
+                                tracker.log({
+                                    "cmmd_eval/real_samples": [
+                                        wandb.Image(real_images[i].permute(1, 2, 0).numpy())
+                                        for i in range(min(4, len(real_images)))
+                                    ],
+                                    "cmmd_eval/generated_samples": [
+                                        wandb.Image(generated_images[i])
+                                        for i in range(min(4, len(generated_images)))
+                                    ]
+                                })
+                        
+                        # Clean up
+                        del eval_pipeline
+                        torch.cuda.empty_cache()
 
                 logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
@@ -1000,7 +1279,12 @@ def main(args):
                     # set `keep_fp32_wrapper` to True because we do not want to remove
                     # mixed precision hooks while we are still training
                     pipeline.unet = accelerator.unwrap_model(unet, keep_fp32_wrapper=True)
-                    pipeline.text_encoder = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
+                    
+                    # Always ensure we have a text encoder
+                    if args.train_text_encoder:
+                        pipeline.text_encoder = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
+                    # If we didn't train the text encoder, the pipeline's default text_encoder is used
+                    
                     pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
                     pipeline = pipeline.to(accelerator.device)
                     pipeline.set_progress_bar_config(disable=True)
@@ -1018,10 +1302,8 @@ def main(args):
                     for tracker in accelerator.trackers:
                         if tracker.name == "tensorboard":
                             np_images = np.stack([np.asarray(img) for img in images])
-                            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+                            tracker.writer.add_images("validation", np_images, global_step, dataformats="NHWC")
                         if tracker.name == "wandb":
-                            import wandb
-
                             tracker.log(
                                 {
                                     "validation": [
@@ -1056,6 +1338,8 @@ def main(args):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        # Create pipeline for evaluation and saving
+        pipeline = None
         if args.use_lora:
             unwarpped_unet = accelerator.unwrap_model(unet)
             unwarpped_unet.save_pretrained(
@@ -1067,6 +1351,23 @@ def main(args):
                     os.path.join(args.output_dir, "text_encoder"),
                     state_dict=accelerator.get_state_dict(text_encoder),
                 )
+            
+            # Load the pipeline with LoRA weights for evaluation
+            # Always load the text encoder from the original model if not training it
+            if args.train_text_encoder:
+                pipeline = DiffusionPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    unet=unwarpped_unet,
+                    text_encoder=accelerator.unwrap_model(text_encoder),
+                    revision=args.revision,
+                )
+            else:
+                # Load the original text encoder when we didn't fine-tune it
+                pipeline = DiffusionPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    unet=unwarpped_unet,
+                    revision=args.revision,
+                )
         else:
             pipeline = DiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
@@ -1075,6 +1376,17 @@ def main(args):
                 revision=args.revision,
             )
             pipeline.save_pretrained(args.output_dir)
+            
+        # Evaluate CMMD on the trained model
+        pipeline.to(accelerator.device)
+        cmmd_score = evaluate_cmmd(args, accelerator, pipeline, args.art_style, accelerator.device)
+        
+        # Save CMMD score to a file
+        with open(os.path.join(args.output_dir, "cmmd_results.txt"), "w") as f:
+            f.write(f"Style: {args.art_style}\n")
+            f.write(f"CMMD Score: {cmmd_score}\n")
+            f.write(f"Number of real images: {args.evaluation_images}\n")
+            f.write(f"Number of generated images: {args.evaluation_images}\n")
 
         if args.push_to_hub:
             api.upload_folder(

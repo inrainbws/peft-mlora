@@ -212,8 +212,8 @@ class MLoraConfig:
     lr_multiplier: float = field(
         default=1., metadata={"help": "Learning rate multiplier for LoRA weights"}
     )
-    normal_init: bool = field(
-        default=False, metadata={"help": "If true, is initialized with normal distribution"}
+    init_mode: str = field(
+        default="ones", metadata={"help": "init mode"}
     )
 
 @dataclass

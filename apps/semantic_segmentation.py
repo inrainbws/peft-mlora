@@ -30,6 +30,8 @@ wandb.login(key="28899d4b108b71d6f70baa06baf5bfc684bcac97")
 def parse_args():
     parser = argparse.ArgumentParser(description='Train semantic segmentation model with LoRA')
     parser.add_argument('--r', type=int, default=16, help='LoRA rank')
+    parser.add_argument('--lora_alpha', type=float, default=None, 
+                        help='LoRA alpha parameter. If not specified, equals to r for additive LoRA and 1 for multiplicative LoRA')
     parser.add_argument('--base_model', type=str, choices=['segformer', 'upernet'],
                         default='segformer', help='Base model to use: segformer or upernet')
     parser.add_argument('--use_mlora', action='store_true',
@@ -42,6 +44,8 @@ def parse_args():
                         help='Fix A for multiplicative LoRA')
     parser.add_argument('--fix_b', action='store_true',
                         help='Fix B for multiplicative LoRA')
+    parser.add_argument('--use_normal_init', action='store_true',
+                        help='Initialize with normal distribution for multiplicative LoRA')
     parser.add_argument('--num_samples', type=int, default=45193,
                         help='Number of samples to use from the dataset')
     parser.add_argument('--epochs', type=int, default=1,
@@ -149,7 +153,7 @@ modules_to_save = ["decode_head"]
 
 additive_lora_config = LoraConfig(
     r=args.r,
-    lora_alpha=args.r,
+    lora_alpha=args.lora_alpha if args.lora_alpha is not None else args.r,
     target_modules=target_modules,
     modules_to_save=modules_to_save,
     lora_dropout=0.1,
@@ -158,7 +162,7 @@ additive_lora_config = LoraConfig(
 
 multiplicative_lora_config = LoraConfig(
     r=args.r,
-    lora_alpha=1,
+    lora_alpha=args.lora_alpha if args.lora_alpha is not None else 1,
     target_modules=target_modules,
     modules_to_save=modules_to_save,
     lora_dropout=0.1,
@@ -170,7 +174,7 @@ multiplicative_lora_config = LoraConfig(
         fix_a=args.fix_a,
         fix_b=args.fix_b,
         lr_multiplier=3.,
-        normal_init=False,
+        normal_init=args.use_normal_init,
     ),
 )
 
@@ -181,11 +185,13 @@ print_trainable_parameters(lora_model)
 
 # Set run name
 run_name = (f"{args.base_model}_r{args.r}"
+            f"_a{args.lora_alpha if args.lora_alpha is not None else (args.r if not args.use_mlora else 1)}"
             f"{'_mlora' if args.use_mlora else '_lora'}"
             f"{'_exp' if args.use_exp else ''}"
             f"{'_wn' if args.use_weight_norm else ''}"
             f"{'_fixA' if args.fix_a else ''}"
-            f"{'_fixB' if args.fix_b else ''}")
+            f"{'_fixB' if args.fix_b else ''}"
+            f"{'_normal' if args.use_normal_init else ''}")
 
 # Training arguments
 segformer_training_args = TrainingArguments(

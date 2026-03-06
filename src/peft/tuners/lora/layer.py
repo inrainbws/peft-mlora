@@ -37,6 +37,39 @@ from .config import LoraConfig, MLoraConfig
 from .dora import DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer, _DoraConvNdLayer
 
 
+@torch.no_grad()
+def dual_normal_init_(tensor, mean1=0.0, std1=1.0, mean2=0.0, std2=1.0):
+    """
+    Custom weight initializer that divides weights randomly into two groups
+    and initializes each group with different normal distributions.
+
+    Args:
+        tensor: An n-dimensional torch.Tensor
+        mean1: Mean of the first normal distribution
+        std1: Standard deviation of the first normal distribution
+        mean2: Mean of the second normal distribution
+        std2: Standard deviation of the second normal distribution
+
+    Returns:
+        The initialized tensor
+    """
+    # Create a random binary mask of the same shape as the tensor
+    mask = torch.rand_like(tensor) > 0.5
+
+    # Create temporary tensors for each distribution
+    temp1 = torch.zeros_like(tensor)
+    temp2 = torch.zeros_like(tensor)
+
+    # Fill the temporary tensors with values from the respective distributions
+    temp1.normal_(mean=mean1, std=std1)
+    temp2.normal_(mean=mean2, std=std2)
+
+    # Use the mask to combine values from both distributions
+    tensor.data = torch.where(mask, temp1, temp2)
+
+    return tensor
+
+
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
@@ -215,13 +248,17 @@ class LoraLayer(BaseTunerLayer):
                 nn.init.zeros_(self.lora_embedding_B[adapter_name].bias)
 
     def mlora_init(self, adapter_name):
-        if self.mlora_config.normal_init:
-            nn.init.normal_(self.lora_A[adapter_name].weight, std=1. / self.mlora_config.lr_multiplier)
-            nn.init.normal_(self.lora_B[adapter_name].weight, std=1. / self.mlora_config.lr_multiplier)
+        if self.mlora_config.use_exp:
+            nn.init.normal_(self.lora_A[adapter_name].weight, std=0.01 / self.mlora_config.lr_multiplier)
+            nn.init.normal_(self.lora_B[adapter_name].weight, std=0.01 / self.mlora_config.lr_multiplier)
         else:
-            if self.mlora_config.use_exp:
-                nn.init.normal_(self.lora_A[adapter_name].weight, std=0.01 / self.mlora_config.lr_multiplier)
-                nn.init.normal_(self.lora_B[adapter_name].weight, std=0.01 / self.mlora_config.lr_multiplier)
+            if self.mlora_config.init_mode == "normal":
+                nn.init.normal_(self.lora_A[adapter_name].weight, std=1. / self.mlora_config.lr_multiplier)
+                nn.init.normal_(self.lora_B[adapter_name].weight, std=1. / self.mlora_config.lr_multiplier)
+            elif self.mlora_config.init_mode == "uniform":
+                magnitude = 3. / self.mlora_config.lr_multiplier
+                nn.init.uniform_(self.lora_A[adapter_name].weight, a=-magnitude, b=magnitude)
+                nn.init.uniform_(self.lora_B[adapter_name].weight, a=-magnitude, b=magnitude)
             else:
                 nn.init.normal_(self.lora_A[adapter_name].weight, mean=1. / self.mlora_config.lr_multiplier, std=0.01 / self.mlora_config.lr_multiplier)
                 nn.init.normal_(self.lora_B[adapter_name].weight, mean=1. / self.mlora_config.lr_multiplier, std=0.01 / self.mlora_config.lr_multiplier)

@@ -1,3 +1,6 @@
+import sys, os
+sys.path.insert(0, os.getcwd())
+
 import argparse
 import gc
 import hashlib
@@ -38,15 +41,16 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
-from peft import LoraConfig, get_peft_model
-
+from peft import LoraConfig, MLoraConfig, get_peft_model
+from apps.util import CLIPEvaluator
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.10.0.dev0")
 
 logger = get_logger(__name__)
 
-UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
+# UNET_TARGET_MODULES = ["to_q", "to_v", "query", "value"]  # , "ff.net.0.proj"]
+UNET_TARGET_MODULES = ["conv", "conv1", "conv2", "to_q", "to_v", "query", "value"]
 TEXT_ENCODER_TARGET_MODULES = ["q_proj", "v_proj"]
 
 
@@ -73,10 +77,10 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
-        "--pretrained_model",
+        "--pretrained_model_name_or_path",
         type=str,
-        default="stabilityai/stable-diffusion-xl-base-1.0",
-        required=True,
+        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
+        required=False,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -157,6 +161,11 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--compute_clip_metrics",
+        action="store_true",
+        help="Whether to compute CLIP-I and CLIP-T metrics during validation.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="train_dreambooth_outputs",
@@ -185,7 +194,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--lora_bias",
         type=str,
-        default="none",
+        default="lora_only",
         help="Bias type for Lora. Can be 'none', 'all' or 'lora_only', only used if use_lora is True",
     )
     parser.add_argument(
@@ -212,6 +221,14 @@ def parse_args(input_args=None):
         default="none",
         help="Bias type for Lora. Can be 'none', 'all' or 'lora_only', only used if use_lora and `train_text_encoder` are True",
     )
+    
+    # mlora args
+    parser.add_argument("--use_mlora", action="store_true", help="Whether to use multiplicative LoRA instead of additive LoRA")
+    parser.add_argument("--use_exp", action="store_true", help="Use exponential in multiplicative LoRA")
+    parser.add_argument("--use_weight_norm", action="store_true", help="Use weight normalization for multiplicative LoRA")
+    parser.add_argument("--fix_a", action="store_true", help="Fix A for multiplicative LoRA")
+    parser.add_argument("--fix_b", action="store_true", help="Fix B for multiplicative LoRA")
+    parser.add_argument("--lr_multiplier", type=float, default=3.0, help="Learning rate multiplier for multiplicative LoRA")
 
     parser.add_argument(
         "--num_dataloader_workers", type=int, default=1, help="Num of workers for the training dataloader."
@@ -225,7 +242,7 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=5, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
         "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
@@ -289,7 +306,7 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
         "--lr_num_cycles",
@@ -334,7 +351,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--report_to",
         type=str,
-        default="tensorboard",
+        default="wandb",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
@@ -343,13 +360,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--wandb_key",
         type=str,
-        default=None,
+        default="28899d4b108b71d6f70baa06baf5bfc684bcac97",
         help=("If report to option is set to wandb, api-key for wandb used for login to wandb "),
     )
     parser.add_argument(
         "--wandb_project_name",
         type=str,
-        default=None,
+        default="mlora_dreambooth",
         help=("If report to option is set to wandb, project name in wandb for log tracking  "),
     )
     parser.add_argument(
@@ -712,14 +729,34 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
+    print(unet)
+
     if args.use_lora:
-        config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=UNET_TARGET_MODULES,
-            lora_dropout=args.lora_dropout,
-            bias=args.lora_bias,
-        )
+        if args.use_mlora:
+            config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=1,  # For MLora, alpha is typically set to 1
+                target_modules=UNET_TARGET_MODULES,
+                lora_dropout=args.lora_dropout,
+                bias=args.lora_bias,
+                use_mlora=True,
+                mlora_config=MLoraConfig(
+                    use_exp=args.use_exp,
+                    use_weight_norm=args.use_weight_norm,
+                    fix_a=args.fix_a,
+                    fix_b=args.fix_b,
+                    lr_multiplier=args.lr_multiplier,
+                    normal_init=False,
+                ),
+            )
+        else:
+            config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=UNET_TARGET_MODULES,
+                lora_dropout=args.lora_dropout,
+                bias=args.lora_bias,
+            )
         unet = get_peft_model(unet, config)
         unet.print_trainable_parameters()
         print(unet)
@@ -728,13 +765,31 @@ def main(args):
     if not args.train_text_encoder:
         text_encoder.requires_grad_(False)
     elif args.train_text_encoder and args.use_lora:
-        config = LoraConfig(
-            r=args.lora_text_encoder_r,
-            lora_alpha=args.lora_text_encoder_alpha,
-            target_modules=TEXT_ENCODER_TARGET_MODULES,
-            lora_dropout=args.lora_text_encoder_dropout,
-            bias=args.lora_text_encoder_bias,
-        )
+        if args.use_mlora:
+            config = LoraConfig(
+                r=args.lora_text_encoder_r,
+                lora_alpha=1,  # For MLora, alpha is typically set to 1
+                target_modules=TEXT_ENCODER_TARGET_MODULES,
+                lora_dropout=args.lora_text_encoder_dropout,
+                bias=args.lora_text_encoder_bias,
+                use_mlora=True,
+                mlora_config=MLoraConfig(
+                    use_exp=args.use_exp,
+                    use_weight_norm=args.use_weight_norm,
+                    fix_a=args.fix_a,
+                    fix_b=args.fix_b,
+                    lr_multiplier=args.lr_multiplier,
+                    normal_init=False,
+                ),
+            )
+        else:
+            config = LoraConfig(
+                r=args.lora_text_encoder_r,
+                lora_alpha=args.lora_text_encoder_alpha,
+                target_modules=TEXT_ENCODER_TARGET_MODULES,
+                lora_dropout=args.lora_text_encoder_dropout,
+                bias=args.lora_text_encoder_bias,
+            )
         text_encoder = get_peft_model(text_encoder, config)
         text_encoder.print_trainable_parameters()
         print(text_encoder)
@@ -1015,10 +1070,57 @@ def main(args):
                         image = pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
                         images.append(image)
 
+                    # Compute CLIP-I and CLIP-T metrics if instance images are available
+                    clip_i = None
+                    clip_t = None
+                    
+                    if args.compute_clip_metrics and args.instance_data_dir is not None and accelerator.is_main_process:
+                        # Initialize CLIP evaluator
+                        clip_evaluator = CLIPEvaluator(device=accelerator.device)
+
+                        # Load instance images for CLIP-I calculation
+                        instance_images = []
+                        instance_image_paths = list(Path(args.instance_data_dir).glob("*.jpg")) + list(Path(args.instance_data_dir).glob("*.png"))
+
+                        if instance_image_paths:
+                            for img_path in instance_image_paths[:min(10, len(instance_image_paths))]:  # Limit to 10 images for efficiency
+                                img = Image.open(img_path).convert("RGB")
+                                img = transforms.Resize(args.resolution)(img)
+                                img = transforms.ToTensor()(img)
+                                img = transforms.Normalize([0.5], [0.5])(img)  # Normalize to [-1, 1]
+                                instance_images.append(img)
+
+                            if instance_images:
+                                # Stack instance images
+                                instance_images = torch.stack(instance_images)
+
+                                # Convert generated images to tensors
+                                gen_images = []
+                                for img in images:
+                                    img_tensor = transforms.ToTensor()(img)
+                                    img_tensor = transforms.Normalize([0.5], [0.5])(img_tensor)  # Normalize to [-1, 1]
+                                    gen_images.append(img_tensor)
+                                gen_images = torch.stack(gen_images)
+
+                                # Compute CLIP-I (image-to-image similarity)
+                                clip_i = clip_evaluator.compute_clip_i(instance_images, gen_images)
+
+                                # Compute CLIP-T (text-to-image similarity)
+                                clip_t = clip_evaluator.compute_clip_t(args.validation_prompt, gen_images)
+
+                                logger.info(f"CLIP-I: {clip_i:.4f}, CLIP-T: {clip_t:.4f}")
+
                     for tracker in accelerator.trackers:
                         if tracker.name == "tensorboard":
                             np_images = np.stack([np.asarray(img) for img in images])
                             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+
+                            # Log CLIP metrics if available
+                            if clip_i is not None:
+                                tracker.writer.add_scalar("clip_i", clip_i, global_step)
+                            if clip_t is not None:
+                                tracker.writer.add_scalar("clip_t", clip_t, global_step)
+                                
                         if tracker.name == "wandb":
                             import wandb
 
@@ -1030,6 +1132,12 @@ def main(args):
                                     ]
                                 }
                             )
+                            
+                            # Log CLIP metrics if available
+                            if clip_i is not None:
+                                tracker.log({"clip_i": clip_i})
+                            if clip_t is not None:
+                                tracker.log({"clip_t": clip_t})
 
                     del pipeline
                     torch.cuda.empty_cache()

@@ -13,3 +13,7 @@ pyyaml
 datasets
 psutil
 setuptools
+ftfy
+regex
+timm
+clip @ git+https://github.com/openai/CLIP.git

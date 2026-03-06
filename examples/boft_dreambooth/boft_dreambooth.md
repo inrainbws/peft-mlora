@@ -119,7 +119,7 @@ export CLASS_DIR="./data/class_data/${CLASS_TOKEN}"
 export OUTPUT_DIR="./data/output/${PEFT_TYPE}"
 
 
-accelerate launch train_dreambooth.py \
+accelerate launch dreambooth.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
   --instance_data_dir=$INSTANCE_DIR \
   --class_data_dir="$CLASS_DIR" \

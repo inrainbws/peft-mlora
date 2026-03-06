@@ -32,6 +32,7 @@ echo "Job [$arg_job_name] with $arg_gpu gpus"
 runai submit $arg_job_name \
 	-i $MY_IMAGE \
 	-p $RUNAI_PROJECT \
+	--node-pools default \
 	--gpu $arg_gpu \
 	--cpu 16 --memory 120G \
 	--pvc cvlab-scratch:/scratch \
