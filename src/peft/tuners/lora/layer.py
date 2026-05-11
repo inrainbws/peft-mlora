@@ -87,6 +87,7 @@ class LoraLayer(BaseTunerLayer):
         # Reference: https://arxiv.org/abs/2512.01759
         self.use_mlora = False
         self.mlora_config = None
+        self.use_asym_lora = False
         self.scaling = {}
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
@@ -167,7 +168,8 @@ class LoraLayer(BaseTunerLayer):
         use_dora: bool = False,
         lora_bias: bool = False,
         use_mlora = False,
-        mlora_config = None
+        mlora_config = None,
+        use_asym_lora = False,
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -175,6 +177,7 @@ class LoraLayer(BaseTunerLayer):
 
         self.use_mlora = use_mlora
         self.mlora_config = MLoraConfig(**mlora_config) if type(mlora_config) is dict else mlora_config
+        self.use_asym_lora = use_asym_lora
 
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
@@ -230,6 +233,9 @@ class LoraLayer(BaseTunerLayer):
             self.mlora_init(adapter_name)
 
         self.set_adapter(self.active_adapters)
+
+        if self.use_asym_lora:
+            self.asym_lora_init(adapter_name)
 
     def reset_lora_parameters(self, adapter_name, init_lora_weights):
         if init_lora_weights is False:
@@ -289,6 +295,56 @@ class LoraLayer(BaseTunerLayer):
                 # multiplying by lr_multiplier, the effective scale ~= 1
                 nn.init.normal_(self.lora_A[adapter_name].weight, mean=1. / self.mlora_config.lr_multiplier, std=0.01 / self.mlora_config.lr_multiplier)
                 nn.init.normal_(self.lora_B[adapter_name].weight, mean=1. / self.mlora_config.lr_multiplier, std=0.01 / self.mlora_config.lr_multiplier)
+
+    def asym_lora_init(self, adapter_name):
+        """Asymmetric LoRA init (arXiv 2402.16842).
+
+        A is set to the first r right-singular vectors of a uniform random
+        matrix (rows orthonormal in the input direction), B is zeroed, and
+        A is frozen. Supports Linear, Conv*d, and Embedding adapters; for
+        conv kernels the input axes (in_channels × kernel) are flattened
+        before SVD and the result is reshaped back into the conv kernel.
+        For Embedding this inverts PEFT's usual A=0/B=normal init.
+        """
+        r = self.r[adapter_name]
+        if adapter_name in self.lora_embedding_A.keys():
+            # Embedding: lora_embedding_A is (r, num_embeddings),
+            # lora_embedding_B is (embedding_dim, r), both raw Parameters.
+            A = self.lora_embedding_A[adapter_name]
+            in_features = A.shape[1]
+            random_w = torch.rand(self.out_features, in_features,
+                                  device=A.device, dtype=A.dtype) - 0.5
+            _, _, Vh = torch.linalg.svd(random_w, full_matrices=True)
+            A.data.copy_(Vh[:, :r].T.contiguous())
+            A.requires_grad = False
+            nn.init.zeros_(self.lora_embedding_B[adapter_name])
+            return
+
+        A = self.lora_A[adapter_name].weight
+        in_features = A.shape[1]
+        if A.dim() == 2:
+            # Linear: A is (r, in_features).
+            random_w = torch.rand(self.out_features, in_features,
+                                  device=A.device, dtype=A.dtype) - 0.5
+            _, _, Vh = torch.linalg.svd(random_w, full_matrices=True)
+            # Vh has shape (in_features, in_features); rows are right singular vectors.
+            # Official recipe: V_rand[:, :r].T == first r columns of Vh transposed.
+            A.data.copy_(Vh[:, :r].T.contiguous())
+        else:
+            # Conv*d: A is (r, in_features, *kernel) — flatten input axes,
+            # run SVD on (out_features, in_features*prod(kernel)), then
+            # reshape Vh[:, :r].T back into the conv kernel layout.
+            kernel = tuple(A.shape[2:])
+            flat_in = in_features * math.prod(kernel)
+            random_w = torch.rand(self.out_features, flat_in,
+                                  device=A.device, dtype=A.dtype) - 0.5
+            _, _, Vh = torch.linalg.svd(random_w, full_matrices=True)
+            A.data.copy_(Vh[:, :r].T.reshape(r, in_features, *kernel).contiguous())
+        A.requires_grad = False
+
+        nn.init.zeros_(self.lora_B[adapter_name].weight)
+        if self.lora_bias[adapter_name]:
+            nn.init.zeros_(self.lora_B[adapter_name].bias)
 
     def olora_init(self, adapter_name):
         base_layer = self.get_base_layer()
@@ -623,6 +679,7 @@ class Linear(nn.Module, LoraLayer):
         lora_bias: bool = False,
         use_mlora = False,
         mlora_config = None,
+        use_asym_lora = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -641,6 +698,7 @@ class Linear(nn.Module, LoraLayer):
             lora_bias=lora_bias,
             use_mlora=use_mlora,
             mlora_config=mlora_config,
+            use_asym_lora=use_asym_lora,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
@@ -913,6 +971,7 @@ class Embedding(nn.Module, LoraLayer):
         lora_bias: bool = False,
         use_mlora: bool = False,
         mlora_config = None,
+        use_asym_lora = False,
         **kwargs,
     ) -> None:
         if lora_bias:
@@ -934,17 +993,19 @@ class Embedding(nn.Module, LoraLayer):
             lora_bias=lora_bias,
             use_mlora=use_mlora,
             mlora_config=mlora_config,
+            use_asym_lora=use_asym_lora,
         )
 
     def update_layer(
         self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora, lora_bias,
-        use_mlora=False, mlora_config=None
+        use_mlora=False, mlora_config=None, use_asym_lora=False
     ):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
         self.use_mlora = use_mlora
         self.mlora_config = MLoraConfig(**mlora_config) if type(mlora_config) is dict else mlora_config
+        self.use_asym_lora = use_asym_lora
 
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
@@ -984,6 +1045,9 @@ class Embedding(nn.Module, LoraLayer):
             self.mlora_init(adapter_name)
 
         self.set_adapter(self.active_adapters)
+
+        if self.use_asym_lora:
+            self.asym_lora_init(adapter_name)
 
     def dora_init(self, adapter_name: str) -> None:
         if self.lora_magnitude_vector is None:
@@ -1203,6 +1267,7 @@ class _ConvNd(nn.Module, LoraLayer):
         lora_bias: bool = False,
         use_mlora = False,
         mlora_config = None,
+        use_asym_lora = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1225,17 +1290,19 @@ class _ConvNd(nn.Module, LoraLayer):
             lora_bias=lora_bias,
             use_mlora=use_mlora,
             mlora_config=mlora_config,
+            use_asym_lora=use_asym_lora,
         )
 
     def update_layer(
         self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora, lora_bias,
-        use_mlora=False, mlora_config=None
+        use_mlora=False, mlora_config=None, use_asym_lora=False
     ):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
 
         self.use_mlora = use_mlora
         self.mlora_config = MLoraConfig(**mlora_config) if type(mlora_config) is dict else mlora_config
+        self.use_asym_lora = use_asym_lora
 
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
@@ -1281,6 +1348,9 @@ class _ConvNd(nn.Module, LoraLayer):
             self.mlora_init(adapter_name)
 
         self.set_adapter(self.active_adapters)
+
+        if self.use_asym_lora:
+            self.asym_lora_init(adapter_name)
 
     def _get_dora_factor_view(self):
         return (-1,) + (1,) * (self._kernel_dim - 1)
@@ -2074,6 +2144,7 @@ def dispatch_default(
 
     kwargs["use_mlora"] = lora_config.use_mlora
     kwargs["mlora_config"] = lora_config.mlora_config
+    kwargs["use_asym_lora"] = lora_config.use_asym_lora
 
     if isinstance(target, BaseTunerLayer):
         target_base_layer = target.get_base_layer()

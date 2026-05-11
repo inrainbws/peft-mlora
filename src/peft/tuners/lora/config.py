@@ -558,6 +558,12 @@ class LoraConfig(PeftConfig):
         default=None,
         metadata={"help": "MultiplicativeLora configurations"},
     )
+    use_asym_lora: bool = field(
+        default=False,
+        metadata={"help": "Whether to use asymmetric LoRA "
+                          "(arXiv 2402.16842): A is a frozen random "
+                          "orthogonal projection, only B trains."},
+    )
 
     def to_dict(self):
         """
