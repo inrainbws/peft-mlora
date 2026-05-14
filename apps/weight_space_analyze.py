@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import os
+import queue as _queue
 import re
 from pathlib import Path
 
@@ -24,6 +25,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 torch.set_num_threads(4)
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -67,6 +69,11 @@ def parse_args():
     p.add_argument("--skip_lmc", action="store_true")
     p.add_argument("--with_w2t", action="store_true",
                    help="also compute Weight2Token canonical metrics")
+    p.add_argument("--gpus", type=int, nargs="+", default=None,
+                   help="if set, evaluate LMC grid points in parallel — one "
+                        "worker per listed GPU id. CPU-side analysis (cosine, "
+                        "φ, W2T) still runs sequentially in the parent. When "
+                        "unset, LMC runs sequentially on --device.")
     return p.parse_args()
 
 
@@ -120,7 +127,12 @@ def interp_sd(sd1, sd2, alpha):
     return {k: (1.0 - alpha) * sd1[k] + alpha * sd2[k] for k in sd1}
 
 
-def tokenize_eval(model_name, batch_size):
+def tokenize_val_ds(model_name):
+    """CPU-only MRPC validation tokenization. Returns (val_ds, tokenizer).
+
+    Doing this in the parent (before spawning workers) avoids races on the
+    HuggingFace datasets cache when multiple workers tokenize concurrently.
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="right")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -133,12 +145,19 @@ def tokenize_eval(model_name, batch_size):
     tok_ds = datasets["validation"].map(
         tok, batched=True, remove_columns=["idx", "sentence1", "sentence2"])
     tok_ds = tok_ds.rename_column("label", "labels")
+    return tok_ds, tokenizer
 
+
+def make_eval_dl(val_ds, tokenizer, batch_size):
     def collate(ex):
         return tokenizer.pad(ex, padding="longest", return_tensors="pt")
+    return DataLoader(val_ds, shuffle=False, collate_fn=collate,
+                      batch_size=batch_size)
 
-    return DataLoader(tok_ds, shuffle=False, collate_fn=collate,
-                      batch_size=batch_size), tokenizer
+
+def tokenize_eval(model_name, batch_size):
+    val_ds, tokenizer = tokenize_val_ds(model_name)
+    return make_eval_dl(val_ds, tokenizer, batch_size), tokenizer
 
 
 def eval_model(model, dl, metric, device):
@@ -177,23 +196,141 @@ def phi_matrix(sd1, sd2, mod, variant, r, lora_alpha):
     return w2t.phi_subspace(U1, U2, r)
 
 
-def lmc_curve(base_model_name, variant, sd_init, sd1, sd2, alphas,
-              r, lora_alpha, eval_dl, metric, device):
-    cfg = build_config(variant, r, lora_alpha)
-    curve = {}
-    for a in alphas:
-        sd = interp_sd(sd1, sd2, a)
+def _attach_lmc_to_pair_row(pair_row, curve, alphas):
+    accs = {a: curve[a]["accuracy"] for a in alphas}
+    a0, a1 = alphas[0], alphas[-1]
+    mid = alphas[len(alphas) // 2]
+    pair_row["lmc_barrier"] = max(accs[a0], accs[a1]) - accs[mid]
+    pair_row["lmc_curve"] = {str(a): curve[a] for a in alphas}
+
+
+def process_pair(variant, lam, pair_idx, pair_dir, args, sample_mod,
+                 analysis_dir, eval_dl, metric, model, device, log_prefix=""):
+    """End-to-end per-pair analysis: cosine, φ, optional W2T, heatmaps (pair 0
+    only), and optional LMC curve. Reuses the caller-provided model for LMC.
+    Returns (pair_row, lmc_curve_or_None).
+    """
+    sd1 = torch.load(pair_dir / "run1" / "adapter.pt", map_location="cpu")
+    sd2 = torch.load(pair_dir / "run2" / "adapter.pt", map_location="cpu")
+
+    print(f"\n{log_prefix}[{variant} λ={lam:.3f} pair={pair_idx}] analyzing",
+          flush=True)
+
+    pair_row = {"pair": pair_idx}
+
+    # cosine
+    cosines = cosine_per_module(sd1, sd2, variant, args.r, args.lora_alpha)
+    cos_vals = [v for v in cosines.values() if not np.isnan(v)]
+    cos_mean = float(np.mean(cos_vals)) if cos_vals else float("nan")
+    pair_row["cosine_mean"] = cos_mean
+    pair_row["cosine_per_module"] = cosines
+
+    # subspace similarity φ
+    modules = discover_modules(sd1)
+    phi_diag_per_mod = []
+    for mod in modules:
+        phi = phi_matrix(sd1, sd2, mod, variant, args.r, args.lora_alpha)
+        phi_diag_per_mod.append(np.diag(phi))
+    phi_diag = np.stack(phi_diag_per_mod).mean(axis=0)
+    phi_diag_mean = float(phi_diag.mean())
+    pair_row["phi_diag_mean"] = phi_diag_mean
+    pair_row["phi_diag"] = phi_diag.tolist()
+
+    if pair_idx == 0:
+        phi_sample = phi_matrix(sd1, sd2, sample_mod, variant,
+                                args.r, args.lora_alpha)
+        save_heatmap(
+            phi_sample,
+            analysis_dir / "plots" / f"phi_heatmap_lambda{lam}.png",
+            f"φ(i,j)  {variant} λ={lam:.3f}\n{sample_mod}")
+
+    if args.with_w2t:
+        wm = w2t_metrics(sd1, sd2, variant, args.r, args.lora_alpha, sample_mod)
+        assert abs(wm["phi_U_diag_mean"] - phi_diag_mean) < 1e-5, (
+            f"phi_U_diag_mean {wm['phi_U_diag_mean']} vs legacy "
+            f"phi_diag_mean {phi_diag_mean}")
+        pair_row["w2t_u_cos_per_rank"] = wm["u_cos_per_rank"].tolist()
+        pair_row["w2t_v_cos_per_rank"] = wm["v_cos_per_rank"].tolist()
+        pair_row["w2t_sigma_log_ratio_per_rank"] = \
+            wm["sigma_log_ratio_per_rank"].tolist()
+        pair_row["w2t_phi_U_diag_mean"] = wm["phi_U_diag_mean"]
+        pair_row["w2t_phi_V_diag_mean"] = wm["phi_V_diag_mean"]
+        pair_row["w2t_sigma_cos"] = wm["sigma_cos"]
+        pair_row["w2t_sigma_log_cos"] = wm["sigma_log_cos"]
+        pair_row["w2t_sigma_l1"] = wm["sigma_l1"]
+        pair_row["w2t_u_cos_mean"] = float(wm["u_cos_per_rank"].mean())
+        pair_row["w2t_v_cos_mean"] = float(wm["v_cos_per_rank"].mean())
+        if pair_idx == 0:
+            save_cos_heatmap(
+                wm["u_cos_mat"], wm["modules"],
+                analysis_dir / "plots" / f"w2t_u_cos_heatmap_lambda{lam}.png",
+                f"u_k cos  {variant} λ={lam:.3f}")
+            save_cos_heatmap(
+                wm["v_cos_mat"], wm["modules"],
+                analysis_dir / "plots" / f"w2t_v_cos_heatmap_lambda{lam}.png",
+                f"v_k cos  {variant} λ={lam:.3f}")
+            save_heatmap(
+                wm["phi_V_sample"],
+                analysis_dir / "plots" / f"w2t_phi_V_heatmap_lambda{lam}.png",
+                f"φ_V(i,j)  {variant} λ={lam:.3f}\n{sample_mod}")
+
+    curve = None
+    if not args.skip_lmc:
+        curve = {}
+        for a in args.alphas:
+            sd = interp_sd(sd1, sd2, a)
+            set_peft_model_state_dict(
+                model, {k: v.to(device) for k, v in sd.items()})
+            em = eval_model(model, eval_dl, metric, device)
+            curve[a] = {k: float(v) for k, v in em.items()}
+        _attach_lmc_to_pair_row(pair_row, curve, args.alphas)
+
+    print(f"{log_prefix}  pair{pair_idx}: cosine_mean={cos_mean:.4f}  "
+          f"phi_diag_mean={phi_diag_mean:.4f}"
+          + (f"  barrier={pair_row['lmc_barrier']:.4f}"
+             if "lmc_barrier" in pair_row else ""), flush=True)
+    return pair_row, curve
+
+
+def _worker(gpu_id, job_q, result_q, args, variant, val_ds, sample_mod,
+            analysis_dir_str, model_name):
+    """Per-GPU worker — processes one (lam, pair_idx) per job end-to-end so
+    CPU analysis (cosine/φ/W2T) and GPU LMC eval pipeline naturally across
+    pairs. The PEFT model is built once and reused across pairs via
+    set_peft_model_state_dict."""
+    print(f"[gpu{gpu_id}] worker starting (variant={variant})", flush=True)
+    torch.cuda.set_device(gpu_id)
+    device = f"cuda:{gpu_id}"
+    log_prefix = f"[gpu{gpu_id}] "
+
+    if not args.skip_lmc:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="right")
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        eval_dl = make_eval_dl(val_ds, tokenizer, args.batch_size)
+        # experiment_id keeps each worker's evaluate cache from racing
+        metric = evaluate.load("glue", "mrpc", experiment_id=f"gpu{gpu_id}")
+        cfg = build_config(variant, args.r, args.lora_alpha)
         base = AutoModelForSequenceClassification.from_pretrained(
-            base_model_name, return_dict=True)
+            model_name, return_dict=True)
         model = get_peft_model(base, copy.deepcopy(cfg))
-        set_peft_model_state_dict(
-            model, {k: v.to(device) for k, v in sd.items()})
-        em = eval_model(model, eval_dl, metric, device)
-        curve[a] = {k: float(v) for k, v in em.items()}
-        model.to("cpu")
-        del model, base
-        torch.cuda.empty_cache()
-    return curve
+        model.to(device)
+    else:
+        eval_dl = metric = model = None
+
+    analysis_dir = Path(analysis_dir_str)
+    print(f"{log_prefix}ready, pulling jobs", flush=True)
+
+    while True:
+        job = job_q.get()
+        if job is None:
+            break
+        lam, pair_idx, pair_dir_str = job
+        pair_row, curve = process_pair(
+            variant, lam, pair_idx, Path(pair_dir_str), args, sample_mod,
+            analysis_dir, eval_dl, metric, model, device,
+            log_prefix=log_prefix)
+        result_q.put((lam, pair_idx, pair_row, curve))
 
 
 def save_heatmap(phi, path, title):
@@ -394,22 +531,22 @@ def plot_lmc_curves(lmc_per_lambda, variant, path):
 
 def main():
     args = parse_args()
-    device = args.device if torch.cuda.is_available() else "cpu"
     input_dir = Path(args.input_dir)
 
-    metric = evaluate.load("glue", "mrpc")
-    eval_dl, _ = tokenize_eval(args.model_name, args.batch_size)
+    # CPU-only tokenization in the parent — workers (if any) reuse this so
+    # they don't race on HuggingFace datasets cache locks.
+    val_ds, tokenizer = tokenize_val_ds(args.model_name)
 
     metrics_by_variant = {}
 
     for variant in args.variants:
-        rows = []
         lmc_per_lambda = {}
         analysis_dir = input_dir / variant / "analysis"
         (analysis_dir / "plots").mkdir(parents=True, exist_ok=True)
 
-        sample_mod = None
-
+        # Build job list (lam, pair_idx, pair_dir) for the variant.
+        jobs = []
+        pair_count_by_lam = {}
         for lam in args.lambdas:
             lambda_dir = input_dir / variant / f"lambda_{lam}"
             pair_dirs = sorted(
@@ -420,129 +557,93 @@ def main():
                 # backward compat: pre-multipair layout with run{1,2}/ directly
                 # under lambda_{lam}/
                 pair_dirs = [lambda_dir]
-
-            # per-pair scalar accumulators; aggregated after the pair loop
-            per_pair = []
-
+            pair_count_by_lam[lam] = len(pair_dirs)
             for pair_idx, pair_dir in enumerate(pair_dirs):
-                # load to CPU: cosine/SVD happen on CPU; LMC eval re-loads to GPU.
-                sd1 = torch.load(pair_dir / "run1" / "adapter.pt",
-                                 map_location="cpu")
-                sd2 = torch.load(pair_dir / "run2" / "adapter.pt",
-                                 map_location="cpu")
-                init1 = torch.load(pair_dir / "run1" / "adapter_init.pt",
-                                   map_location="cpu")
+                jobs.append((lam, pair_idx, str(pair_dir)))
 
-                print(f"\n[{variant} λ={lam:.3f} pair={pair_idx}/"
-                      f"{len(pair_dirs)}] analyzing", flush=True)
+        # Pre-pick sample_mod by peeking at any pair's run1 adapter.
+        sd_peek = torch.load(Path(jobs[0][2]) / "run1" / "adapter.pt",
+                             map_location="cpu")
+        sample_mod = discover_modules(sd_peek)[0]
+        del sd_peek
 
-                pair_row = {"pair": pair_idx}
+        # pair_rows[lam][pair_idx] — fixed-size so out-of-order results land correctly
+        pair_rows_by_lam = {lam: [None] * pair_count_by_lam[lam]
+                            for lam in args.lambdas}
 
-                # cosine
-                print("  computing cosine...", flush=True)
-                cosines = cosine_per_module(sd1, sd2, variant,
-                                            args.r, args.lora_alpha)
-                print("  ...done cosine", flush=True)
-                cos_vals = [v for v in cosines.values() if not np.isnan(v)]
-                cos_mean = float(np.mean(cos_vals)) if cos_vals else float("nan")
-                pair_row["cosine_mean"] = cos_mean
-                pair_row["cosine_per_module"] = cosines
+        if args.gpus:
+            ctx = mp.get_context("spawn")
+            job_q = ctx.Queue()
+            result_q = ctx.Queue()
+            for j in jobs:
+                job_q.put(j)
+            for _ in args.gpus:
+                job_q.put(None)
 
-                # subspace similarity φ — mean of diag(φ) across modules
-                print("  computing phi...", flush=True)
-                phi_diag_per_mod = []
-                modules = discover_modules(sd1)
-                if sample_mod is None:
-                    sample_mod = modules[0]
-                for mod in modules:
-                    phi = phi_matrix(sd1, sd2, mod, variant,
-                                     args.r, args.lora_alpha)
-                    phi_diag_per_mod.append(np.diag(phi))
-                print("  ...done phi", flush=True)
-                phi_diag = np.stack(phi_diag_per_mod).mean(axis=0)  # (r,)
-                phi_diag_mean = float(phi_diag.mean())
-                pair_row["phi_diag_mean"] = phi_diag_mean
-                pair_row["phi_diag"] = phi_diag.tolist()
+            procs = [ctx.Process(target=_worker,
+                                 args=(gpu_id, job_q, result_q, args, variant,
+                                       val_ds, sample_mod, str(analysis_dir),
+                                       args.model_name))
+                     for gpu_id in args.gpus]
+            for p in procs:
+                p.start()
 
-                # sample heatmap — save once per (variant, λ) from pair 0
-                if pair_idx == 0:
-                    phi_sample = phi_matrix(sd1, sd2, sample_mod, variant,
-                                            args.r, args.lora_alpha)
-                    save_heatmap(
-                        phi_sample,
-                        analysis_dir / "plots" / f"phi_heatmap_lambda{lam}.png",
-                        f"φ(i,j)  {variant} λ={lam:.3f}\n{sample_mod}")
+            received = 0
+            while received < len(jobs):
+                try:
+                    lam, pair_idx, pair_row, curve = result_q.get(timeout=120.0)
+                except _queue.Empty:
+                    alive = [p for p in procs if p.is_alive()]
+                    if not alive:
+                        bad = [(p.pid, p.exitcode) for p in procs
+                               if p.exitcode not in (0, None)]
+                        raise SystemExit(
+                            f"all workers exited but only {received}/{len(jobs)} "
+                            f"results received; dead workers: {bad}")
+                    continue
+                pair_rows_by_lam[lam][pair_idx] = pair_row
+                if pair_idx == 0 and curve is not None:
+                    lmc_per_lambda[lam] = curve
+                received += 1
 
-                # W2T canonical metrics
-                if args.with_w2t:
-                    print("  computing W2T...", flush=True)
-                    wm = w2t_metrics(sd1, sd2, variant, args.r, args.lora_alpha,
-                                     sample_mod)
-                    print("  ...done W2T", flush=True)
-                    # Pin the φ cumsum refactor: canonical-U φ_diag_mean must
-                    # match the legacy direct-SVD φ_diag_mean.
-                    assert abs(wm["phi_U_diag_mean"] - phi_diag_mean) < 1e-5, (
-                        f"phi_U_diag_mean {wm['phi_U_diag_mean']} vs legacy "
-                        f"phi_diag_mean {phi_diag_mean}")
+            exit_code = 0
+            for p in procs:
+                p.join()
+                if p.exitcode != 0:
+                    exit_code = p.exitcode
+            if exit_code != 0:
+                raise SystemExit(exit_code)
+        else:
+            # Sequential path: build model once per variant and reuse it.
+            device = args.device if torch.cuda.is_available() else "cpu"
+            if not args.skip_lmc:
+                eval_dl = make_eval_dl(val_ds, tokenizer, args.batch_size)
+                metric = evaluate.load("glue", "mrpc")
+                cfg = build_config(variant, args.r, args.lora_alpha)
+                base = AutoModelForSequenceClassification.from_pretrained(
+                    args.model_name, return_dict=True)
+                model = get_peft_model(base, copy.deepcopy(cfg))
+                model.to(device)
+            else:
+                eval_dl = metric = model = None
 
-                    pair_row["w2t_u_cos_per_rank"] = wm["u_cos_per_rank"].tolist()
-                    pair_row["w2t_v_cos_per_rank"] = wm["v_cos_per_rank"].tolist()
-                    pair_row["w2t_sigma_log_ratio_per_rank"] = \
-                        wm["sigma_log_ratio_per_rank"].tolist()
-                    pair_row["w2t_phi_U_diag_mean"] = wm["phi_U_diag_mean"]
-                    pair_row["w2t_phi_V_diag_mean"] = wm["phi_V_diag_mean"]
-                    pair_row["w2t_sigma_cos"] = wm["sigma_cos"]
-                    pair_row["w2t_sigma_log_cos"] = wm["sigma_log_cos"]
-                    pair_row["w2t_sigma_l1"] = wm["sigma_l1"]
-                    pair_row["w2t_u_cos_mean"] = float(
-                        wm["u_cos_per_rank"].mean())
-                    pair_row["w2t_v_cos_mean"] = float(
-                        wm["v_cos_per_rank"].mean())
+            for lam, pair_idx, pair_dir_str in jobs:
+                pair_row, curve = process_pair(
+                    variant, lam, pair_idx, Path(pair_dir_str), args, sample_mod,
+                    analysis_dir, eval_dl, metric, model, device)
+                pair_rows_by_lam[lam][pair_idx] = pair_row
+                if pair_idx == 0 and curve is not None:
+                    lmc_per_lambda[lam] = curve
 
-                    if pair_idx == 0:
-                        save_cos_heatmap(
-                            wm["u_cos_mat"], wm["modules"],
-                            analysis_dir / "plots"
-                            / f"w2t_u_cos_heatmap_lambda{lam}.png",
-                            f"u_k cos  {variant} λ={lam:.3f}")
-                        save_cos_heatmap(
-                            wm["v_cos_mat"], wm["modules"],
-                            analysis_dir / "plots"
-                            / f"w2t_v_cos_heatmap_lambda{lam}.png",
-                            f"v_k cos  {variant} λ={lam:.3f}")
-                        save_heatmap(
-                            wm["phi_V_sample"],
-                            analysis_dir / "plots"
-                            / f"w2t_phi_V_heatmap_lambda{lam}.png",
-                            f"φ_V(i,j)  {variant} λ={lam:.3f}\n{sample_mod}")
-
-                # LMC
-                if not args.skip_lmc:
-                    print("  computing LMC...", flush=True)
-                    curve = lmc_curve(args.model_name, variant, init1, sd1, sd2,
-                                      args.alphas, args.r, args.lora_alpha,
-                                      eval_dl, metric, device)
-                    print("  ...done LMC", flush=True)
-                    if pair_idx == 0:
-                        # per-variant LMC curve plot uses pair 0 as illustrative
-                        lmc_per_lambda[lam] = curve
-                    accs = {a: curve[a]["accuracy"] for a in args.alphas}
-                    a0, a1 = args.alphas[0], args.alphas[-1]
-                    mid = args.alphas[len(args.alphas) // 2]
-                    barrier = max(accs[a0], accs[a1]) - accs[mid]
-                    # barrier = accs[mid]
-                    pair_row["lmc_barrier"] = barrier
-                    pair_row["lmc_curve"] = {str(a): curve[a] for a in args.alphas}
-
-                per_pair.append(pair_row)
-                print(f"  pair{pair_idx}: cosine_mean={cos_mean:.4f}  "
-                      f"phi_diag_mean={phi_diag_mean:.4f}"
-                      + (f"  barrier={pair_row['lmc_barrier']:.4f}"
-                         if "lmc_barrier" in pair_row else ""), flush=True)
-                del sd1, sd2, init1
+            if model is not None:
+                model.to("cpu")
+                del model
                 torch.cuda.empty_cache()
 
-            # aggregate scalars across pairs into mean/std (+ per-pair list)
+        # per-lambda aggregation
+        rows = []
+        for lam in args.lambdas:
+            per_pair = pair_rows_by_lam[lam]
             row = aggregate_pair_rows(per_pair, lam, with_w2t=args.with_w2t,
                                       with_lmc=not args.skip_lmc)
             rows.append(row)

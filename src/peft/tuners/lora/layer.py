@@ -157,6 +157,18 @@ class LoraLayer(BaseTunerLayer):
         self.in_features = in_features
         self.out_features = out_features
 
+    def set_adapter(self, adapter_names):
+        # BaseTunerLayer.set_adapter re-enables requires_grad on every active
+        # adapter's lora_A / lora_B. For asym_lora, A must stay frozen — the
+        # init-time freeze in asym_lora_init would otherwise be undone here
+        # (called from inject_adapter, LoraModel.set_adapter, hot-swap, ...).
+        super().set_adapter(adapter_names)
+        if self.use_asym_lora:
+            for name in self.lora_A:
+                self.lora_A[name].weight.requires_grad = False
+            for name in self.lora_embedding_A:
+                self.lora_embedding_A[name].requires_grad = False
+
     def update_layer(
         self,
         adapter_name,
@@ -248,7 +260,7 @@ class LoraLayer(BaseTunerLayer):
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
                 nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
             elif init_lora_weights.lower() == "gaussian":
-                nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+                nn.init.normal_(self.lora_A[adapter_name].weight)
             else:
                 raise ValueError(f"Unknown initialization {init_lora_weights=}")
             nn.init.zeros_(self.lora_B[adapter_name].weight)
@@ -330,6 +342,8 @@ class LoraLayer(BaseTunerLayer):
             # Vh has shape (in_features, in_features); rows are right singular vectors.
             # Official recipe: V_rand[:, :r].T == first r columns of Vh transposed.
             A.data.copy_(Vh[:, :r].T.contiguous())
+            A.data.mul_(1./A.data.std().item())
+            # A.data.mul_(1./r)
         else:
             # Conv*d: A is (r, in_features, *kernel) — flatten input axes,
             # run SVD on (out_features, in_features*prod(kernel)), then

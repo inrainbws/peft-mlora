@@ -131,6 +131,8 @@ python apps/multitask_interp_analyze.py --input_dir runs/multitask_interp \
     --tasks financial_phrasebank pubmed_qa
 ```
 
+Pass `--per_task_init` to give each task its own random adapter init (seed = `args.seed + task_index`) instead of the default shared init; the per-task init is then saved at `<variant>/<task>/adapter_init.pt`.
+
 Available tasks (`TASKS` dict in `multitask_interp_experiment.py`): `sst2`, `mrpc`, `financial_phrasebank`, `pubmed_qa`. Add new ones by appending to that dict (`load`, `prepare`, `format` callables).
 
 Output layout:
@@ -138,8 +140,9 @@ Output layout:
 ```
 runs/multitask_interp/
   {lora,mlora}/
-    adapter_init.pt
+    adapter_init.pt              # only when sharing inits across tasks (default)
     {task_A,task_B}/{adapter.pt, eval.json}
+                                 # + adapter_init.pt here under --per_task_init
     analysis/{metrics.json, plots/interp_{grid,heatmap}_{task}.png}
   base_acc.json                # zero-shot baseline, written by analyze
 ```

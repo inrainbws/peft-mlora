@@ -29,7 +29,8 @@ def adapter_keys(sd, variant):
     if variant == "lora":
         return a
     if variant == "asym_lora":
-        return a
+        b = [k for k in sd if ".lora_B." in k]
+        return b
     if variant == "mlora":
         b = [k for k in sd if ".lora_B." in k]
         return a + b

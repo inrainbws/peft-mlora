@@ -1,17 +1,18 @@
 """Analysis for the multi-task adapter interpolation experiment.
 
-For each variant, load the two task-specific adapters (sd_A, sd_B) saved by
-`apps/multitask_interp_experiment.py`, grid-interpolate
-   sd_(α,β) = α·sd_A + β·sd_B
-   (LoRA A/B matrices use √α/√β instead — variance preserving across the
-    bilinear product B·A so that B(α,β)·A(α,β) contributes α·B_1A_1+β·B_2A_2
-    on the diagonal)
-on a 2-D grid, and evaluate every interpolated adapter on BOTH tasks.
-Writes metrics.json + a 3-D accuracy-vs-(α,β) surface plot per (variant,task).
+For each variant, load every task-specific adapter saved by
+`apps/multitask_interp_experiment.py`. Then for each unordered pair of
+tasks (task_A, task_B) from the pool, grid-interpolate in ΔW space:
+each LoRA-wrapped base weight is patched to W_orig + scaling·(α·B_1A_1
++ β·B_2A_2) and the LoRA adapter itself is left at default init (B=0)
+so it contributes nothing. Evaluate on the pair's two tasks. Writes
+one `metrics_<A>__<B>.json` and accuracy-surface + heatmap plots per
+(variant, pair, eval-task).
 """
 
 import argparse
 import copy
+import itertools
 import json
 import os
 import queue as _queue
@@ -41,29 +42,26 @@ from transformers import (
     DataCollatorForSeq2Seq,
 )
 
-from peft import (
-    get_peft_model,
-    set_peft_model_state_dict,
-)
+from peft import get_peft_model
 
 from multitask_interp_experiment import (
     build_config,
     generate_and_score,
     tokenize_task,
+    TASKS
 )
 
-
 def _grid_default():
-    # 0.0, 0.1, …, 1.5  (rounded to avoid float-print drift)
-    return [round(i * 0.1, 2) for i in range(16)]
-
+    return [round(-1 + i * 0.25, 2) for i in range(13)]
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--input_dir", type=str, required=True)
-    p.add_argument("--variants", nargs="+", default=["lora", "mlora", "asym_lora"])
-    p.add_argument("--tasks", nargs=2,
-                   default=["financial_phrasebank", "pubmed_qa"])
+    p.add_argument("--variants", nargs="+", default=["lora", "asym_lora"])
+    p.add_argument("--tasks", nargs="+",
+                   default=list(TASKS.keys()),
+                   help="pool of task names; the analyzer iterates over "
+                        "all unordered pairs (task_A, task_B)")
     p.add_argument("--alphas", type=float, nargs="+", default=_grid_default())
     p.add_argument("--betas", type=float, nargs="+", default=_grid_default())
     p.add_argument("--model_name", type=str, default="google/flan-t5-base")
@@ -80,35 +78,50 @@ def parse_args():
     return p.parse_args()
 
 
-def _is_lora_factor(key):
-    return ("lora_A" in key) or ("lora_B" in key)
+def _snapshot_base_weights(model):
+    """{named_modules_path: W_orig.detach().clone()} for every LoRA layer.
 
-
-def interp_sd_grid(sd1, sd2, alpha, beta, variant):
-    """Grid interp: α·W_1 + β·W_2 in general; LoRA A/B factors use √α/√β.
-
-    For LoRA layers ΔW = B·A, scaling both factors by √α (resp √β) gives
-    α·B_1·A_1 + β·B_2·A_2 + √(αβ)·(B_1·A_2 + B_2·A_1) — the diagonal terms
-    match the linear weight-space combination, hence "variance preserving".
-
-    For asym-LoRA, A is frozen and identical across both task runs, so we
-    interpolate B linearly (α·B_1 + β·B_2) and leave A unscaled. This gives
-    exactly α·B_1·A + β·B_2·A with no cross terms.
+    The path is exactly what `model.named_modules()` returns, which for a
+    PEFT-wrapped seq2seq is `base_model.model.<...>.<proj>` (e.g.
+    `base_model.model.encoder.block.0.layer.0.SelfAttention.q`).
     """
-    sa = alpha ** 0.5
-    sb = beta ** 0.5
     out = {}
-    for k in sd1:
-        if variant == "asym_lora" and "lora_A" in k:
-            # frozen A: identical in sd1 and sd2 — pass through unchanged
-            out[k] = sd1[k]
-        elif variant == "asym_lora" and "lora_B" in k:
-            out[k] = alpha * sd1[k] + beta * sd2[k]
-        elif _is_lora_factor(k):
-            out[k] = sa * sd1[k] + sb * sd2[k]
-        else:
-            out[k] = alpha * sd1[k] + beta * sd2[k]
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_A") and "default" in module.lora_A:
+            out[name] = module.base_layer.weight.detach().clone()
     return out
+
+
+def _layer_deltas(sd_A, sd_B, alpha, beta):
+    """{named_modules_path: α·B_1A_1 + β·B_2A_2} — caller applies scaling.
+
+    Keys are the LoRA layer's `named_modules` path (matches the snapshot).
+    Saved adapter keys look like `base_model.model.<path>.lora_B.default.weight`
+    — strip only the trailing `.lora_B.default.weight` to recover <path>.
+    """
+    deltas = {}
+    for k in sd_A:
+        if "lora_B" not in k:
+            continue
+        kA = k.replace("lora_B", "lora_A")
+        prefix = k.rsplit(".lora_B", 1)[0]
+        B1, A1 = sd_A[k], sd_A[kA]
+        B2, A2 = sd_B[k], sd_B[kA]
+        deltas[prefix] = alpha * (B1 @ A1) + beta * (B2 @ A2)
+    return deltas
+
+
+def _apply_delta_w(model, sd_A, sd_B, alpha, beta, orig_weights):
+    """Patch each LoRA-wrapped base weight to W_orig + scaling·ΔW."""
+    deltas = _layer_deltas(sd_A, sd_B, alpha, beta)
+    for name, module in model.named_modules():
+        if name not in orig_weights:
+            continue
+        scaling = module.scaling["default"]
+        W = module.base_layer.weight
+        dw = deltas[name].to(W.device, dtype=W.dtype)
+        W.data.copy_(orig_weights[name])
+        W.data.add_(scaling * dw)
 
 
 def make_val_loader(task, tokenizer, max_src, max_tgt, batch_size):
@@ -149,18 +162,18 @@ def eval_base(model_name, val_dls, tokenizer, device, max_new_tokens):
     return out
 
 
-def plot_surface(alphas, betas, acc_grid, base_acc, path, title):
-    """acc_grid[i, j] = accuracy at (alphas[i], betas[j])."""
-    A, B = np.meshgrid(alphas, betas, indexing="ij")
+def plot_surface(xs, ys, acc_grid, base_acc, path, title, xlabel, ylabel):
+    """acc_grid[i, j] = accuracy at (xs[i], ys[j])."""
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
     fig = plt.figure(figsize=(7, 5.5))
     ax = fig.add_subplot(111, projection="3d")
-    surf = ax.plot_surface(A, B, acc_grid, cmap="viridis",
+    surf = ax.plot_surface(X, Y, acc_grid, cmap="viridis",
                            edgecolor="none", alpha=0.9)
     if base_acc is not None:
-        ax.plot_surface(A, B, np.full_like(acc_grid, base_acc),
+        ax.plot_surface(X, Y, np.full_like(acc_grid, base_acc),
                         color="gray", alpha=0.15)
-    ax.set_xlabel("α  (sd_A weight)")
-    ax.set_ylabel("β  (sd_B weight)")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     ax.set_zlabel("accuracy")
     ax.set_zlim(0, 1)
     ax.set_title(title)
@@ -170,28 +183,32 @@ def plot_surface(alphas, betas, acc_grid, base_acc, path, title):
     plt.close(fig)
 
 
-def plot_heatmap(alphas, betas, acc_grid, path, title):
-    """2-D heatmap of acc_grid[i, j] over (alphas[i], betas[j])."""
+def plot_heatmap(xs, ys, acc_grid, path, title, xlabel, ylabel):
+    """2-D heatmap of acc_grid[i, j] over (xs[i], ys[j])."""
     fig, ax = plt.subplots(figsize=(6.5, 5))
-    # imshow expects rows=y, cols=x; we want x=α, y=β
+    # imshow's extent gives outer cell boundaries — to make cell centers land
+    # on the xs/ys values (so text annotations align), pad by half a cell.
+    dx = (max(xs) - min(xs)) / (len(xs) - 1) if len(xs) > 1 else 1.0
+    dy = (max(ys) - min(ys)) / (len(ys) - 1) if len(ys) > 1 else 1.0
+    # imshow expects rows=y, cols=x; acc_grid[i, j] is at (xs[i], ys[j])
     im = ax.imshow(acc_grid.T, origin="lower", cmap="viridis",
                    vmin=0, vmax=1, aspect="auto",
-                   extent=[min(alphas), max(alphas),
-                           min(betas), max(betas)])
-    ax.set_xlabel("α  (sd_A weight)")
-    ax.set_ylabel("β  (sd_B weight)")
+                   extent=[min(xs) - dx / 2, max(xs) + dx / 2,
+                           min(ys) - dy / 2, max(ys) + dy / 2])
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     fig.colorbar(im, ax=ax, label="accuracy")
 
     # annotate each cell with its accuracy; flip text color for contrast on
     # dark cells (viridis is dark at low values)
-    fontsize = max(4, min(8, 60 // max(len(alphas), len(betas))))
-    for i, a in enumerate(alphas):
-        for j, b in enumerate(betas):
+    fontsize = max(4, min(8, 60 // max(len(xs), len(ys))))
+    for i, x in enumerate(xs):
+        for j, y in enumerate(ys):
             v = acc_grid[i, j]
             if np.isnan(v):
                 continue
-            ax.text(a, b, f"{v:.2f}",
+            ax.text(x, y, f"{v:.2f}",
                     ha="center", va="center", fontsize=fontsize,
                     color="white" if v < 0.5 else "black")
 
@@ -217,7 +234,7 @@ def _eval_base_worker(gpu_id, args, val_ds_dict, result_q):
     result_q.put(base_acc)
 
 
-def _worker(gpu_id, job_q, result_q, args, variant, sd_A, sd_B, val_ds_dict):
+def _worker(gpu_id, job_q, result_q, args, variant, sds_by_task, val_ds_dict):
     print(f"[gpu{gpu_id}] grid worker starting (variant={variant})", flush=True)
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
@@ -231,24 +248,25 @@ def _worker(gpu_id, job_q, result_q, args, variant, sd_A, sd_B, val_ds_dict):
     base = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
     model = get_peft_model(base, copy.deepcopy(cfg))
     model.to(device)
+    orig_weights = _snapshot_base_weights(model)
     print(f"{log_prefix}ready, pulling jobs", flush=True)
 
     while True:
         job = job_q.get()
         if job is None:
             break
-        i, j, alpha, beta = job
-        sd = interp_sd_grid(sd_A, sd_B, alpha, beta, variant)
-        set_peft_model_state_dict(
-            model, {k: v.to(device) for k, v in sd.items()})
+        task_A, task_B, i, j, alpha, beta = job
+        _apply_delta_w(model, sds_by_task[task_A], sds_by_task[task_B],
+                       alpha, beta, orig_weights)
         accs = {}
-        for task in args.tasks:
+        for task in (task_A, task_B):
             acc = generate_and_score(model, val_dls[task], tokenizer,
                                      device, args.max_target_len)
             accs[task] = acc
-            print(f"{log_prefix}[{variant} α={alpha} β={beta} task={task}] "
-                  f"acc={acc:.4f}", flush=True)
-        result_q.put((i, j, accs))
+            print(f"{log_prefix}[{variant} pair={task_A}__{task_B} "
+                  f"α={alpha} β={beta} eval={task}] acc={acc:.4f}",
+                  flush=True)
+        result_q.put((task_A, task_B, i, j, accs))
 
 
 def main():
@@ -294,43 +312,45 @@ def main():
     alphas = list(args.alphas)
     betas = list(args.betas)
 
+    pairs = list(itertools.combinations(args.tasks, 2))
+
     for variant in args.variants:
         var_dir = in_root / variant
-        sd_A = torch.load(var_dir / args.tasks[0] / "adapter.pt",
-                          map_location="cpu")
-        sd_B = torch.load(var_dir / args.tasks[1] / "adapter.pt",
-                          map_location="cpu")
+        sds_by_task = {t: torch.load(var_dir / t / "adapter.pt",
+                                     map_location="cpu")
+                       for t in args.tasks}
+        saved_endpoint_acc = {}
+        for t in args.tasks:
+            with (var_dir / t / "eval.json").open() as f:
+                saved_endpoint_acc[t] = json.load(f)["accuracy"]
 
-        with (var_dir / args.tasks[0] / "eval.json").open() as f:
-            saved_A = json.load(f)["accuracy"]
-        with (var_dir / args.tasks[1] / "eval.json").open() as f:
-            saved_B = json.load(f)["accuracy"]
-
-        # results[task] is a [len(alphas), len(betas)] array of accuracies
-        results = {t: np.full((len(alphas), len(betas)), np.nan)
-                   for t in args.tasks}
+        # pair_results[(A, B)][task] = [len(alphas), len(betas)] grid
+        pair_results = {(a, b): {a: np.full((len(alphas), len(betas)), np.nan),
+                                 b: np.full((len(alphas), len(betas)), np.nan)}
+                        for a, b in pairs}
 
         if args.gpus:
             ctx = mp.get_context("spawn")
             job_q = ctx.Queue()
             result_q = ctx.Queue()
             n_jobs = 0
-            for i, alpha in enumerate(alphas):
-                for j, beta in enumerate(betas):
-                    job_q.put((i, j, alpha, beta))
-                    n_jobs += 1
+            for task_A, task_B in pairs:
+                for i, alpha in enumerate(alphas):
+                    for j, beta in enumerate(betas):
+                        job_q.put((task_A, task_B, i, j, alpha, beta))
+                        n_jobs += 1
             for _ in args.gpus:
                 job_q.put(None)
             procs = [ctx.Process(target=_worker,
                                  args=(gpu_id, job_q, result_q, args,
-                                       variant, sd_A, sd_B, val_ds_dict))
+                                       variant, sds_by_task, val_ds_dict))
                      for gpu_id in args.gpus]
             for p in procs:
                 p.start()
             received = 0
             while received < n_jobs:
                 try:
-                    i, j, accs = result_q.get(timeout=30.0)
+                    tA, tB, i, j, accs = result_q.get(timeout=30.0)
                 except _queue.Empty:
                     # detect dead workers so we don't hang forever
                     alive = [p for p in procs if p.is_alive()]
@@ -341,8 +361,8 @@ def main():
                             f"all workers exited but only {received}/{n_jobs} "
                             f"results received; dead workers: {bad}")
                     continue
-                for task in args.tasks:
-                    results[task][i, j] = accs[task]
+                for task, acc in accs.items():
+                    pair_results[(tA, tB)][task][i, j] = acc
                 received += 1
             exit_code = 0
             for p in procs:
@@ -354,64 +374,95 @@ def main():
         else:
             cfg = build_config(variant, args.r, args.lora_alpha)
 
-            # build the peft-wrapped model once per variant; reload the
-            # interpolated state dict in place each grid point.
+            # build the peft-wrapped model once per variant; patch base
+            # weights in place each grid point. Adapter factors stay at
+            # default init (lora_B = 0) so the adapter adds nothing.
             base = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
             model = get_peft_model(base, copy.deepcopy(cfg))
+            model.to(device)
+            orig_weights = _snapshot_base_weights(model)
 
-            for i, alpha in enumerate(alphas):
-                for j, beta in enumerate(betas):
-                    sd = interp_sd_grid(sd_A, sd_B, alpha, beta, variant)
-                    set_peft_model_state_dict(
-                        model, {k: v.to(device) for k, v in sd.items()})
-                    for task in args.tasks:
-                        acc = generate_and_score(model, val_dls[task], tokenizer,
-                                                 device, args.max_target_len)
-                        results[task][i, j] = acc
-                        print(f"[{variant} α={alpha} β={beta} task={task}] "
-                              f"acc={acc:.4f}", flush=True)
+            for task_A, task_B in pairs:
+                sd_A = sds_by_task[task_A]
+                sd_B = sds_by_task[task_B]
+                results = pair_results[(task_A, task_B)]
+                for i, alpha in enumerate(alphas):
+                    for j, beta in enumerate(betas):
+                        _apply_delta_w(model, sd_A, sd_B, alpha, beta,
+                                       orig_weights)
+                        for task in (task_A, task_B):
+                            acc = generate_and_score(model, val_dls[task],
+                                                     tokenizer, device,
+                                                     args.max_target_len)
+                            results[task][i, j] = acc
+                            print(f"[{variant} pair={task_A}__{task_B} "
+                                  f"α={alpha} β={beta} eval={task}] "
+                                  f"acc={acc:.4f}", flush=True)
 
             model.to("cpu")
             del model, base
             torch.cuda.empty_cache()
 
-        # endpoint sanity: (α=1, β=0) ↔ sd_A, (α=0, β=1) ↔ sd_B
-        eps = 1e-3
-        if 1.0 in alphas and 0.0 in betas:
-            ai = alphas.index(1.0)
-            bj = betas.index(0.0)
-            ep_A = results[args.tasks[0]][ai, bj]
-            if abs(ep_A - saved_A) > eps:
-                print(f"WARN [{variant}] (α=1,β=0) acc on {args.tasks[0]} "
-                      f"({ep_A:.4f}) != saved ({saved_A:.4f})")
-        if 0.0 in alphas and 1.0 in betas:
-            ai = alphas.index(0.0)
-            bj = betas.index(1.0)
-            ep_B = results[args.tasks[1]][ai, bj]
-            if abs(ep_B - saved_B) > eps:
-                print(f"WARN [{variant}] (α=0,β=1) acc on {args.tasks[1]} "
-                      f"({ep_B:.4f}) != saved ({saved_B:.4f})")
-
         out_dir = var_dir / "analysis"
         (out_dir / "plots").mkdir(parents=True, exist_ok=True)
-        with (out_dir / "metrics.json").open("w") as f:
-            json.dump({"variant": variant,
-                       "alphas": alphas,
-                       "betas": betas,
-                       "tasks": list(args.tasks),
-                       "results": {t: results[t].tolist() for t in args.tasks},
-                       "saved_endpoint_acc": {args.tasks[0]: saved_A,
-                                              args.tasks[1]: saved_B},
-                       "base_acc": base_acc},
-                      f, indent=2)
-        for task in args.tasks:
-            plot_surface(alphas, betas, results[task],
-                         base_acc.get(task) if base_acc else None,
-                         out_dir / "plots" / f"interp_grid_{task}.png",
-                         f"Multi-task grid interp — {variant} / {task}")
-            plot_heatmap(alphas, betas, results[task],
-                         out_dir / "plots" / f"interp_heatmap_{task}.png",
-                         f"Multi-task grid interp — {variant} / {task}")
+
+        for task_A, task_B in pairs:
+            results = pair_results[(task_A, task_B)]
+            pair_tag = f"{task_A}__{task_B}"
+
+            # endpoint sanity: (α=1, β=0) ↔ sd_A, (α=0, β=1) ↔ sd_B
+            eps = 1e-3
+            if 1.0 in alphas and 0.0 in betas:
+                ai = alphas.index(1.0)
+                bj = betas.index(0.0)
+                ep_A = results[task_A][ai, bj]
+                if abs(ep_A - saved_endpoint_acc[task_A]) > eps:
+                    print(f"WARN [{variant} pair={pair_tag}] (α=1,β=0) acc "
+                          f"on {task_A} ({ep_A:.4f}) != saved "
+                          f"({saved_endpoint_acc[task_A]:.4f})")
+            if 0.0 in alphas and 1.0 in betas:
+                ai = alphas.index(0.0)
+                bj = betas.index(1.0)
+                ep_B = results[task_B][ai, bj]
+                if abs(ep_B - saved_endpoint_acc[task_B]) > eps:
+                    print(f"WARN [{variant} pair={pair_tag}] (α=0,β=1) acc "
+                          f"on {task_B} ({ep_B:.4f}) != saved "
+                          f"({saved_endpoint_acc[task_B]:.4f})")
+
+            with (out_dir / f"metrics_{pair_tag}.json").open("w") as f:
+                json.dump({"variant": variant,
+                           "alphas": alphas,
+                           "betas": betas,
+                           "task_A": task_A,
+                           "task_B": task_B,
+                           "results": {t: results[t].tolist()
+                                       for t in (task_A, task_B)},
+                           "saved_endpoint_acc": {
+                               task_A: saved_endpoint_acc[task_A],
+                               task_B: saved_endpoint_acc[task_B]},
+                           "base_acc": base_acc},
+                          f, indent=2)
+            for task in (task_A, task_B):
+                # put the eval task's adapter weight on X
+                if task == task_A:
+                    xs, ys, grid = alphas, betas, results[task]
+                    xlabel, ylabel = "α  (sd_A weight)", "β  (sd_B weight)"
+                else:
+                    xs, ys, grid = betas, alphas, results[task].T
+                    xlabel, ylabel = "β  (sd_B weight)", "α  (sd_A weight)"
+                plot_surface(xs, ys, grid,
+                             base_acc.get(task) if base_acc else None,
+                             out_dir / "plots" /
+                                 f"interp_grid_{pair_tag}__{task}.png",
+                             f"Multi-task grid interp — {variant} / "
+                             f"{pair_tag} → {task}",
+                             xlabel, ylabel)
+                plot_heatmap(xs, ys, grid,
+                             out_dir / "plots" /
+                                 f"interp_heatmap_{pair_tag}__{task}.png",
+                             f"Multi-task grid interp — {variant} / "
+                             f"{pair_tag} → {task}",
+                             xlabel, ylabel)
 
 
 if __name__ == "__main__":

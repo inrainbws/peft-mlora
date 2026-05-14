@@ -11,6 +11,9 @@ import math
 import os
 from pathlib import Path
 
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+
 import numpy as np
 import torch
 import torch.multiprocessing as mp
